@@ -3,6 +3,7 @@ package full
 import (
 	"context"
 	"image"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -214,6 +215,102 @@ func TestNewReleasesTab(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("PlayRelease not invoked")
+}
+
+// fakeRadio implements RadioService for the Browse panel tests.
+type fakeRadio struct {
+	favs       []radio.Station
+	browse     []radio.Station
+	added      []string
+	removed    []string
+	savedOrder []string
+}
+
+func (f *fakeRadio) Favorites(context.Context) ([]radio.Station, error) { return f.favs, nil }
+func (f *fakeRadio) Browse(context.Context) ([]radio.Station, error)    { return f.browse, nil }
+func (f *fakeRadio) Search(_ context.Context, _ string) ([]radio.Station, error) {
+	return f.browse, nil
+}
+func (f *fakeRadio) AddFavorite(_ context.Context, st radio.Station) error {
+	f.added = append(f.added, st.ID)
+	f.favs = append(f.favs, st)
+	return nil
+}
+func (f *fakeRadio) RemoveFavorite(_ context.Context, st radio.Station) error {
+	f.removed = append(f.removed, st.ID)
+	out := f.favs[:0]
+	for _, s := range f.favs {
+		if s.ID != st.ID {
+			out = append(out, s)
+		}
+	}
+	f.favs = out
+	return nil
+}
+func (f *fakeRadio) SaveOrder(ids []string) { f.savedOrder = ids }
+
+func mustModel(m tea.Model, _ tea.Cmd) Model { return m.(Model) }
+
+// Radio panel: selecting Browse loads favorites; reorder persists; enter plays
+// the selected station; f toggles favorite.
+func TestRadioPanelFavoritesReorderPlay(t *testing.T) {
+	fe := newFake(library.NowPlaying{})
+	fr := &fakeRadio{favs: []radio.Station{
+		{ID: "a", Name: "Alpha", StreamURL: "http://a"},
+		{ID: "b", Name: "Bravo", StreamURL: "http://b"},
+		{ID: "c", Name: "Charlie", StreamURL: "http://c"},
+	}}
+	m := New(fe, nil).WithRadio(fr) // pills = [Podcast, Browse]
+	m.width, m.height = 80, 30
+
+	// Select the Browse pill (index 1) — lazy-loads favorites.
+	m2, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("2")})
+	fm := m2.(Model)
+	if !fm.browseSelected() {
+		t.Fatal("Browse pill not selected")
+	}
+	if cmd == nil {
+		t.Fatal("expected favorites fetch command")
+	}
+	fm = mustModel(fm.Update(cmd()))
+	if !strings.Contains(fm.View(), "Alpha") {
+		t.Errorf("favorites not rendered: %q", fm.View())
+	}
+
+	// Reorder: move Alpha (sel 0) down → order b,a,c persisted.
+	fm = mustModel(fm.Update(tea.KeyMsg{Type: tea.KeyShiftDown}))
+	if want := []string{"b", "a", "c"}; !reflect.DeepEqual(fr.savedOrder, want) {
+		t.Fatalf("savedOrder = %v, want %v", fr.savedOrder, want)
+	}
+	if fm.favSel != 1 || fm.favorites[1].ID != "a" {
+		t.Fatalf("after reorder favSel=%d favorites=%v", fm.favSel, fr.savedOrder)
+	}
+
+	// Enter plays the now-selected favorite (Alpha).
+	fm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ps, ok := fe.target().(library.PlayStation); ok {
+			if ps.Station.ID != "a" {
+				t.Fatalf("played %q, want a", ps.Station.ID)
+			}
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, ok := fe.target().(library.PlayStation); !ok {
+		t.Fatal("enter did not play a station")
+	}
+
+	// Unfavorite the selected station via f → RemoveFavorite + refresh.
+	_, fcmd := fm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("f")})
+	if fcmd == nil {
+		t.Fatal("expected favorite-toggle command")
+	}
+	fcmd() // runs RemoveFavorite + re-fetch
+	if len(fr.removed) != 1 || fr.removed[0] != "a" {
+		t.Fatalf("removed = %v, want [a]", fr.removed)
+	}
 }
 
 // Behavior 5 (engine): staging sets StagedTarget without starting playback.

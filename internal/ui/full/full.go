@@ -37,6 +37,18 @@ type Engine interface {
 	NewReleases(ctx context.Context) ([]pocketcasts.NewRelease, error)
 }
 
+// RadioService is the radio surface the Browse panel drives: favorites
+// (ordered), browse/search, favorite mutations, and order persistence. The
+// engine stays focused on playback; this is a thin UI-facing adapter.
+type RadioService interface {
+	Favorites(ctx context.Context) ([]radio.Station, error)
+	Browse(ctx context.Context) ([]radio.Station, error)
+	Search(ctx context.Context, query string) ([]radio.Station, error)
+	AddFavorite(ctx context.Context, st radio.Station) error
+	RemoveFavorite(ctx context.Context, st radio.Station) error
+	SaveOrder(ids []string)
+}
+
 // Pill represents one source tab.
 type Pill struct {
 	Label  string
@@ -68,11 +80,29 @@ type Model struct {
 	newRelSel    int
 	newRelErr    error
 	newRelLoaded bool
+
+	// Radio panel state (shown when the Browse pill is selected).
+	radio        RadioService
+	radioTab     int // 0 = Favorites, 1 = Browse
+	favorites    []radio.Station
+	favSel       int
+	favErr       error
+	favLoaded    bool
+	browse       []radio.Station
+	browseSel    int
+	browseErr    error
+	browseLoaded bool
+	favIDs       map[string]bool // station IDs currently favorited
 }
 
 const (
 	tabUpNext = iota
 	tabNewReleases
+)
+
+const (
+	radioFavorites = iota
+	radioBrowse
 )
 
 type nowMsg library.NowPlaying
@@ -92,6 +122,16 @@ type newReleasesMsg struct {
 	err error
 }
 
+type favoritesMsg struct {
+	stations []radio.Station
+	err      error
+}
+
+type browseMsg struct {
+	stations []radio.Station
+	err      error
+}
+
 // New builds a full Model. streams is the list of favorite stations to show as
 // pills (capped at 3). Call tea.NewProgram with tea.WithAltScreen().
 func New(e Engine, streams []radio.Station) Model {
@@ -102,6 +142,8 @@ func New(e Engine, streams []radio.Station) Model {
 		}
 		pills = append(pills, Pill{Label: st.Name, Target: library.PlayStation{Station: st}})
 	}
+	// Browse pill: no Target — selecting it opens the radio panel.
+	pills = append(pills, Pill{Label: "Browse", Target: nil})
 	return Model{
 		engine:   e,
 		pills:    pills,
@@ -111,8 +153,18 @@ func New(e Engine, streams []radio.Station) Model {
 		proto:    art.Detect(),
 		width:    80,
 		height:   24,
+		favIDs:   map[string]bool{},
 	}
 }
+
+// WithRadio attaches the radio service that powers the Browse panel.
+func (m Model) WithRadio(svc RadioService) Model {
+	m.radio = svc
+	return m
+}
+
+// browseSelected reports whether the Browse pill (last pill) is highlighted.
+func (m Model) browseSelected() bool { return m.selected == len(m.pills)-1 }
 
 // Init subscribes to engine state and loads the Up Next list.
 func (m Model) Init() tea.Cmd {
@@ -123,6 +175,26 @@ func (m Model) fetchUpNext() tea.Cmd {
 	return func() tea.Msg {
 		eps, err := m.engine.UpNextList(context.Background())
 		return upNextMsg{eps: eps, err: err}
+	}
+}
+
+func (m Model) fetchFavorites() tea.Cmd {
+	return func() tea.Msg {
+		if m.radio == nil {
+			return favoritesMsg{}
+		}
+		st, err := m.radio.Favorites(context.Background())
+		return favoritesMsg{stations: st, err: err}
+	}
+}
+
+func (m Model) fetchBrowse() tea.Cmd {
+	return func() tea.Msg {
+		if m.radio == nil {
+			return browseMsg{}
+		}
+		st, err := m.radio.Browse(context.Background())
+		return browseMsg{stations: st, err: err}
 	}
 }
 
@@ -196,6 +268,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		slog.Debug("full.newReleases", "count", len(m.newReleases), "err", msg.err)
 
+	case favoritesMsg:
+		m.favorites = msg.stations
+		m.favErr = msg.err
+		m.favLoaded = true
+		m.favIDs = map[string]bool{}
+		for _, s := range m.favorites {
+			m.favIDs[s.ID] = true
+		}
+		m.favSel = clamp(m.favSel, len(m.favorites))
+		slog.Debug("full.favorites", "count", len(m.favorites), "err", msg.err)
+
+	case browseMsg:
+		m.browse = msg.stations
+		m.browseErr = msg.err
+		m.browseLoaded = true
+		m.browseSel = clamp(m.browseSel, len(m.browse))
+		slog.Debug("full.browse", "count", len(m.browse), "err", msg.err)
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
@@ -204,31 +294,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.podcastSelected() {
 				m.podcastTab = (m.podcastTab + 1) % 2
 				if m.podcastTab == tabNewReleases && !m.newRelLoaded {
-					return m, m.fetchNewReleases() // lazy load on first view
+					return m, m.fetchNewReleases()
+				}
+			} else if m.browseSelected() {
+				m.radioTab = (m.radioTab + 1) % 2
+				if m.radioTab == radioBrowse && !m.browseLoaded {
+					return m, m.fetchBrowse()
 				}
 			}
 			return m, nil
 		case "up", "k":
-			if m.podcastSelected() {
-				m.moveSel(-1)
-			}
+			m.moveListSel(-1)
 			return m, nil
 		case "down", "j":
-			if m.podcastSelected() {
-				m.moveSel(1)
-			}
+			m.moveListSel(1)
 			return m, nil
+		case "shift+up", "shift+down":
+			return m, m.reorderFavorite(map[bool]int{true: -1, false: 1}[msg.String() == "shift+up"])
+		case "f":
+			return m, m.toggleFavorite()
 		case " ":
 			if m.engine.CurrentTarget() == nil {
-				t := m.pills[m.selected].Target
-				slog.Info("full.space.play_selected", "pill", m.pills[m.selected].Label)
-				go func() { _ = m.engine.PlayTarget(context.Background(), t) }()
+				if t := m.selectedPlayTarget(); t != nil {
+					go func() { _ = m.engine.PlayTarget(context.Background(), t) }()
+				}
 			} else {
-				slog.Debug("full.space.toggle")
 				m.engine.TogglePlayback()
 			}
 		case "right", "l":
-			if m.seekable() { // no skip on live/continuous streams
+			if m.seekable() {
 				m.engine.SkipForward()
 			}
 		case "left", "h":
@@ -236,33 +330,124 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.engine.SkipBack()
 			}
 		case "tab":
-			m.selected = (m.selected + 1) % len(m.pills)
-			m.engine.StageTarget(m.pills[m.selected].Target)
+			return m, m.selectPill((m.selected + 1) % len(m.pills))
 		case "shift+tab":
-			m.selected = (m.selected - 1 + len(m.pills)) % len(m.pills)
-			m.engine.StageTarget(m.pills[m.selected].Target)
+			return m, m.selectPill((m.selected - 1 + len(m.pills)) % len(m.pills))
 		case "1", "2", "3", "4", "5":
-			idx := int(msg.String()[0]-'1')
-			if idx < len(m.pills) {
-				m.selected = idx
-				m.engine.StageTarget(m.pills[m.selected].Target)
+			if idx := int(msg.String()[0] - '1'); idx < len(m.pills) {
+				return m, m.selectPill(idx)
 			}
 		case "enter":
-			target := m.pills[m.selected].Target
-			if m.podcastSelected() {
-				switch {
-				case m.podcastTab == tabUpNext && len(m.upNext) > 0:
-					target = library.UpNextAt{Index: m.upNextSel}
-				case m.podcastTab == tabNewReleases && len(m.newReleases) > 0:
-					target = library.PlayRelease{Release: m.newReleases[m.newRelSel]}
-				}
+			if t := m.selectedPlayTarget(); t != nil {
+				go func() { _ = m.engine.PlayTarget(context.Background(), t) }()
 			}
-			go func() {
-				_ = m.engine.PlayTarget(context.Background(), target)
-			}()
 		}
 	}
 	return m, nil
+}
+
+// selectPill highlights pill idx, stages its (non-nil) target, and lazy-loads
+// the radio favorites when the Browse pill is first selected.
+func (m *Model) selectPill(idx int) tea.Cmd {
+	m.selected = idx
+	if t := m.pills[idx].Target; t != nil {
+		m.engine.StageTarget(t)
+	}
+	if m.browseSelected() && !m.favLoaded {
+		return m.fetchFavorites()
+	}
+	return nil
+}
+
+// selectedPlayTarget resolves what enter/space should play given the current
+// pane and selection, or nil if there's nothing to play.
+func (m Model) selectedPlayTarget() library.Target {
+	if m.podcastSelected() {
+		switch {
+		case m.podcastTab == tabUpNext && len(m.upNext) > 0:
+			return library.UpNextAt{Index: m.upNextSel}
+		case m.podcastTab == tabNewReleases && len(m.newReleases) > 0:
+			return library.PlayRelease{Release: m.newReleases[m.newRelSel]}
+		}
+		return nil
+	}
+	if m.browseSelected() {
+		if st, ok := m.selectedStation(); ok {
+			return library.PlayStation{Station: st}
+		}
+		return nil
+	}
+	return m.pills[m.selected].Target // stream quick-play pill
+}
+
+// selectedStation returns the highlighted station in the active radio sub-tab.
+func (m Model) selectedStation() (radio.Station, bool) {
+	if m.radioTab == radioFavorites {
+		if m.favSel < len(m.favorites) {
+			return m.favorites[m.favSel], true
+		}
+	} else if m.browseSel < len(m.browse) {
+		return m.browse[m.browseSel], true
+	}
+	return radio.Station{}, false
+}
+
+// moveListSel moves the selection in whatever list the active pane shows.
+func (m *Model) moveListSel(delta int) {
+	switch {
+	case m.podcastSelected():
+		m.moveSel(delta)
+	case m.browseSelected() && m.radioTab == radioFavorites:
+		m.favSel = clamp(m.favSel+delta, len(m.favorites))
+	case m.browseSelected():
+		m.browseSel = clamp(m.browseSel+delta, len(m.browse))
+	}
+}
+
+// reorderFavorite moves the selected favorite by delta and persists the new
+// order. No-op outside the Favorites sub-tab.
+func (m *Model) reorderFavorite(delta int) tea.Cmd {
+	if !m.browseSelected() || m.radioTab != radioFavorites || m.radio == nil {
+		return nil
+	}
+	if len(m.favorites) == 0 {
+		return nil
+	}
+	target := clamp(m.favSel+delta, len(m.favorites))
+	if target == m.favSel {
+		return nil
+	}
+	m.favorites = radio.MoveFavorite(m.favorites, m.favSel, delta)
+	m.favSel = target
+	m.radio.SaveOrder(radio.FavoriteIDs(m.favorites))
+	return nil
+}
+
+// toggleFavorite adds/removes the selected station from favorites and refreshes
+// the favorites list. No-op outside the radio panel.
+func (m *Model) toggleFavorite() tea.Cmd {
+	if !m.browseSelected() || m.radio == nil {
+		return nil
+	}
+	st, ok := m.selectedStation()
+	if !ok {
+		return nil
+	}
+	wasFav := m.favIDs[st.ID]
+	svc := m.radio
+	return func() tea.Msg {
+		var err error
+		if wasFav {
+			err = svc.RemoveFavorite(context.Background(), st)
+		} else {
+			err = svc.AddFavorite(context.Background(), st)
+		}
+		if err != nil {
+			slog.Warn("full.toggleFavorite", "err", err)
+		}
+		stations, ferr := svc.Favorites(context.Background())
+		return favoritesMsg{stations: stations, err: ferr}
+	}
 }
 
 // moveSel moves the selection cursor in the active podcast sub-tab by delta,
@@ -347,7 +532,8 @@ func (m Model) View() string {
 	b.WriteString(m.transportRow())
 	b.WriteString("\n")
 
-	// ── Podcast lists (Up Next / New Releases sub-tabs) ──────
+	// ── Lists (podcast pane or radio panel) ──────────────────
+	hint := "q quit · tab/1-4 select · enter play · space ⏯ · ← → skip"
 	if m.podcastSelected() {
 		b.WriteString(divider(m.width))
 		b.WriteString("\n")
@@ -358,16 +544,95 @@ func (m Model) View() string {
 		} else {
 			b.WriteString(m.upNextSection())
 		}
+		hint = "q quit · tab select · [ ] tabs · ↑↓ move · enter play · space ⏯"
+	} else if m.browseSelected() {
+		b.WriteString(divider(m.width))
+		b.WriteString("\n")
+		b.WriteString(m.radioTabsRow())
+		b.WriteString("\n")
+		b.WriteString(m.radioSection())
+		hint = "q quit · tab select · [ ] tabs · ↑↓ move · enter play · f ♥ · ⇧↑↓ reorder"
 	}
 
 	b.WriteString(divider(m.width))
 	b.WriteString("\n")
-	hint := "q quit · tab/1-4 select · enter play · space ⏯ · ← → skip"
-	if m.podcastSelected() {
-		hint = "q quit · tab select · [ ] tabs · ↑↓ move · enter play · space ⏯"
-	}
 	b.WriteString(theme.MutedStyle.Render(hint))
 
+	return b.String()
+}
+
+// radioTabsRow renders the Favorites / Browse sub-tab header.
+func (m Model) radioTabsRow() string {
+	return "  " +
+		theme.PillStyle(m.radioTab == radioFavorites).Render("Favorites") + " " +
+		theme.PillStyle(m.radioTab == radioBrowse).Render("Browse")
+}
+
+// radioSection renders the active radio sub-tab's station list.
+func (m Model) radioSection() string {
+	if m.radio == nil {
+		return theme.MutedStyle.Render("  Radio unavailable") + "\n"
+	}
+	stations, sel, err, loaded := m.favorites, m.favSel, m.favErr, m.favLoaded
+	empty := "  No favorites yet — press f on a Browse station"
+	if m.radioTab == radioBrowse {
+		stations, sel, err, loaded = m.browse, m.browseSel, m.browseErr, m.browseLoaded
+		empty = "  No stations"
+	}
+	if err != nil {
+		return theme.MutedStyle.Render("  Unavailable") + "\n"
+	}
+	if !loaded {
+		return theme.MutedStyle.Render("  Loading…") + "\n"
+	}
+	if len(stations) == 0 {
+		return theme.MutedStyle.Render(empty) + "\n"
+	}
+
+	var b strings.Builder
+	visible := m.height - 16
+	if visible < 3 {
+		visible = 3
+	}
+	start, end := scrollWindow(sel, len(stations), visible)
+	for i := start; i < end; i++ {
+		st := stations[i]
+		cursor := "  "
+		if i == sel {
+			cursor = theme.AccentStyle.Render("▸ ")
+		}
+		heart := " "
+		if m.favIDs[st.ID] {
+			heart = theme.AccentStyle.Render("♥")
+		}
+		meta := st.Country
+		if st.Codec != "" {
+			if meta != "" {
+				meta += " · "
+			}
+			meta += st.Codec
+		}
+		nameW := m.width - 4 - lipgloss.Width(heart) - 1 - len(meta) - 1
+		if nameW < 8 {
+			nameW = 8
+		}
+		name := truncate(st.Name, nameW)
+		nameStyled := name
+		if i == sel {
+			nameStyled = theme.TitleStyle.Render(name)
+		}
+		pad := m.width - 2 - lipgloss.Width(cursor) - lipgloss.Width(heart) - 1 - lipgloss.Width(name) - len(meta)
+		if pad < 1 {
+			pad = 1
+		}
+		b.WriteString(cursor)
+		b.WriteString(heart)
+		b.WriteString(" ")
+		b.WriteString(nameStyled)
+		b.WriteString(strings.Repeat(" ", pad))
+		b.WriteString(theme.MutedStyle.Render(meta))
+		b.WriteString("\n")
+	}
 	return b.String()
 }
 
@@ -514,7 +779,6 @@ func (m Model) pillsRow() string {
 		label := truncate(p.Label, 14)
 		parts = append(parts, theme.PillStyle(i == m.selected).Render(label))
 	}
-	parts = append(parts, theme.MutedStyle.Render("[Browse]"))
 	return strings.Join(parts, " ")
 }
 

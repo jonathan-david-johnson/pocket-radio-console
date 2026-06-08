@@ -187,12 +187,56 @@ func launchFull(ctx context.Context, d *deps, eng *library.Engine) error {
 		eng = library.New(d.api, p, d.auth, library.WithTracklister(d.radio))
 		defer eng.Close()
 	}
-	model := full.New(eng, streams)
+	model := full.New(eng, streams).WithRadio(&radioSvc{
+		dir:    d.radio,
+		store:  d.store,
+		userID: d.auth.UserUUID(),
+	})
 	_, runErr := tea.NewProgram(model,
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	).Run()
 	return runErr
+}
+
+// radioSvc adapts the radio directory + state store to full.RadioService:
+// favorites are returned in the user's saved order, and reorders persist to
+// state.json.
+type radioSvc struct {
+	dir    *radio.Client
+	store  *config.Store
+	userID string
+}
+
+func (r *radioSvc) Favorites(ctx context.Context) ([]radio.Station, error) {
+	favs, err := r.dir.Favorites(ctx, r.userID)
+	if err != nil {
+		return nil, err
+	}
+	st, _ := r.store.LoadState()
+	return radio.OrderFavorites(favs, st.FavoritesOrder), nil
+}
+
+func (r *radioSvc) Browse(ctx context.Context) ([]radio.Station, error) {
+	return r.dir.Top(ctx, 50)
+}
+
+func (r *radioSvc) Search(ctx context.Context, query string) ([]radio.Station, error) {
+	return r.dir.Search(ctx, query)
+}
+
+func (r *radioSvc) AddFavorite(ctx context.Context, st radio.Station) error {
+	return r.dir.AddFavorite(ctx, r.userID, st.ID)
+}
+
+func (r *radioSvc) RemoveFavorite(ctx context.Context, st radio.Station) error {
+	return r.dir.RemoveFavorite(ctx, r.userID, st.ID)
+}
+
+func (r *radioSvc) SaveOrder(ids []string) {
+	st, _ := r.store.LoadState()
+	st.FavoritesOrder = ids
+	_ = r.store.SaveState(st)
 }
 
 // runMini resolves arg and plays the result in mini mode.
