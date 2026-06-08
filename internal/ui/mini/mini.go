@@ -22,9 +22,12 @@ type Engine interface {
 }
 
 var (
-	playStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#F44336")).Bold(true)
-	titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Bold(true)
-	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#9C9FA4"))
+	// ANSI color 1 = red on any terminal (light or dark theme).
+	playStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)
+	// No explicit color — bold inherits the terminal's default foreground.
+	titleStyle = lipgloss.NewStyle().Bold(true)
+	// ANSI color 8 = bright black / dark gray, readable on both themes.
+	dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
 type nowMsg library.NowPlaying

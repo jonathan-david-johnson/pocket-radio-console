@@ -21,8 +21,9 @@ type mpvPlayer struct {
 	conn   net.Conn
 	socket string
 
-	mu    sync.RWMutex
-	state PlaybackState
+	mu          sync.RWMutex
+	state       PlaybackState
+	pendingSeek time.Duration // seek issued after file-loaded when > 0
 
 	events  chan PlayerEvent
 	reqID   int
@@ -69,6 +70,8 @@ func New() (Player, error) {
 	_ = p.command("observe_property", 2, "duration")
 	_ = p.command("observe_property", 3, "pause")
 	_ = p.command("observe_property", 4, "metadata")
+	// file-loaded fires when mpv has opened the file and is ready to seek.
+	_ = p.command("observe_property", 5, "playback-restart")
 
 	go p.readLoop()
 	return p, nil
@@ -108,15 +111,13 @@ func (p *mpvPlayer) setProperty(name string, value interface{}) error {
 	return p.command("set_property", name, value)
 }
 
-// Load replaces the current file. startAt > 0 issues a start offset (podcast resume).
+// Load replaces the current file. startAt > 0 seeks after file-loaded fires,
+// which is more reliable for streaming URLs than loadfile's start= option.
 func (p *mpvPlayer) Load(url string, startAt time.Duration) error {
 	p.mu.Lock()
 	p.state = PlaybackState{Playing: true}
+	p.pendingSeek = startAt
 	p.mu.Unlock()
-	if startAt > 0 {
-		return p.command("loadfile", url, "replace",
-			fmt.Sprintf("start=%d", int(startAt.Seconds())))
-	}
 	return p.command("loadfile", url, "replace")
 }
 
@@ -181,6 +182,15 @@ func (p *mpvPlayer) handle(msg ipcMessage) {
 	switch msg.Event {
 	case "property-change":
 		p.handleProperty(msg)
+	case "file-loaded":
+		// File is open and ready; execute any pending resume seek.
+		p.mu.Lock()
+		seek := p.pendingSeek
+		p.pendingSeek = 0
+		p.mu.Unlock()
+		if seek > 0 {
+			_ = p.command("seek", seek.Seconds(), "absolute")
+		}
 	case "end-file":
 		// "eof" means a finite file finished; other reasons (stop, quit) don't.
 		if msg.Reason == "eof" {
