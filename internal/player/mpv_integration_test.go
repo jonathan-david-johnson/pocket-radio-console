@@ -47,6 +47,43 @@ func TestMpvRealPlayback(t *testing.T) {
 	}
 }
 
+// Regression: Load must force play even when mpv is currently paused, so a
+// source switch starts immediately instead of loading silently.
+func TestMpvLoadUnpauses(t *testing.T) {
+	path := writeSilentWAV(t, 3*time.Second)
+
+	p, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	if err := p.Load(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !waitEvent(t, p, Tick, 5*time.Second) {
+		t.Fatal("no Tick after first load")
+	}
+	_ = p.Pause()
+	time.Sleep(300 * time.Millisecond)
+	if p.State().Playing {
+		t.Fatal("want paused before reload")
+	}
+
+	// Reload while paused — must come back playing without an explicit Resume.
+	if err := p.Load(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.State().Playing {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("Load did not unpause mpv")
+}
+
 func waitEvent(t *testing.T, p Player, kind EventKind, timeout time.Duration) bool {
 	deadline := time.After(timeout)
 	for {

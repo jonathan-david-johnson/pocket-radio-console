@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://api.pocketcasts.com"
-	userAgent      = "PocketRadio/1.0"
+	defaultBaseURL   = "https://api.pocketcasts.com"
+	defaultCacheBase = "https://cache.pocketcasts.com"
+	userAgent        = "PocketRadio/1.0"
 )
 
 // ErrInvalidCredentials is returned for a 401/403 from login or a 401 elsewhere.
@@ -82,19 +83,23 @@ type PocketCasts interface {
 	PlayNow(ctx context.Context, token, deviceID string, ep Episode) error
 	RemoveFromUpNext(ctx context.Context, token, deviceID string, ep Episode) error
 	SkipSettings(ctx context.Context, token string) (Skip, error)
+	NewReleases(ctx context.Context, token string, days int) ([]NewRelease, error)
+	ShowNotes(ctx context.Context, podcastUUID, episodeUUID string) (EpisodeShowNotes, error)
 }
 
 // Client is the concrete HTTP implementation of PocketCasts.
 type Client struct {
-	BaseURL string
-	HTTP    *http.Client
+	BaseURL      string
+	CacheBaseURL string // cache.pocketcasts.com (full episodes + show notes)
+	HTTP         *http.Client
 }
 
 // NewClient returns a Client pointed at the production API.
 func NewClient() *Client {
 	return &Client{
-		BaseURL: defaultBaseURL,
-		HTTP:    &http.Client{Timeout: 30 * time.Second},
+		BaseURL:      defaultBaseURL,
+		CacheBaseURL: defaultCacheBase,
+		HTTP:         &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -103,6 +108,13 @@ func (c *Client) baseURL() string {
 		return c.BaseURL
 	}
 	return defaultBaseURL
+}
+
+func (c *Client) cacheBaseURL() string {
+	if c.CacheBaseURL != "" {
+		return c.CacheBaseURL
+	}
+	return defaultCacheBase
 }
 
 func (c *Client) httpClient() *http.Client {

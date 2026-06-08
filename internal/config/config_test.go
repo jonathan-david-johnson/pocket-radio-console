@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"reflect"
 	"testing"
 )
 
@@ -34,7 +35,7 @@ func TestConfigRoundTripAndPerms(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotSt != st {
+	if !reflect.DeepEqual(gotSt, st) {
 		t.Fatalf("state round-trip mismatch: got %+v want %+v", gotSt, st)
 	}
 	assertMode0600(t, store.statePath())
@@ -45,7 +46,7 @@ func TestLoadMissingFilesAreZero(t *testing.T) {
 	if cfg, err := store.LoadConfig(); err != nil || cfg != (Config{}) {
 		t.Fatalf("missing config: got %+v err %v", cfg, err)
 	}
-	if st, err := store.LoadState(); err != nil || st != (State{}) {
+	if st, err := store.LoadState(); err != nil || !reflect.DeepEqual(st, State{}) {
 		t.Fatalf("missing state: got %+v err %v", st, err)
 	}
 }

@@ -52,6 +52,7 @@ type Client struct {
 	SupabaseURL  string
 	SupabaseKey  string
 	RadioBrowser string
+	ITunesBase   string // iTunes Search base (artwork fallback)
 	HTTP         *http.Client
 }
 
@@ -61,6 +62,7 @@ func NewClient() *Client {
 		SupabaseURL:  defaultSupabaseURL,
 		SupabaseKey:  defaultSupabaseKey,
 		RadioBrowser: defaultRadioBrowser,
+		ITunesBase:   defaultITunesBase,
 		HTTP:         &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -68,6 +70,7 @@ func NewClient() *Client {
 func (c *Client) supabaseURL() string  { return orDefault(c.SupabaseURL, defaultSupabaseURL) }
 func (c *Client) supabaseKey() string  { return orDefault(c.SupabaseKey, defaultSupabaseKey) }
 func (c *Client) radioBrowser() string { return orDefault(c.RadioBrowser, defaultRadioBrowser) }
+func (c *Client) itunesBase() string   { return orDefault(c.ITunesBase, defaultITunesBase) }
 
 func (c *Client) httpClient() *http.Client {
 	if c.HTTP != nil {

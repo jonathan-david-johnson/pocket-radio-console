@@ -118,7 +118,13 @@ func (p *mpvPlayer) Load(url string, startAt time.Duration) error {
 	p.state = PlaybackState{Playing: true}
 	p.pendingSeek = startAt
 	p.mu.Unlock()
-	return p.command("loadfile", url, "replace")
+	if err := p.command("loadfile", url, "replace"); err != nil {
+		return err
+	}
+	// loadfile inherits mpv's current pause property, so switching to a new
+	// source while paused would load it silently. Load means "play now" — force
+	// pause off so a single keypress switches and plays.
+	return p.setProperty("pause", false)
 }
 
 func (p *mpvPlayer) Pause() error  { return p.setProperty("pause", true) }

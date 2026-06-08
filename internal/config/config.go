@@ -21,9 +21,10 @@ type Config struct {
 
 // State holds the cached token and device identity from state.json.
 type State struct {
-	Token    string `json:"token"`
-	UserUUID string `json:"user_uuid"`
-	DeviceID string `json:"device_id"`
+	Token          string   `json:"token"`
+	UserUUID       string   `json:"user_uuid"`
+	DeviceID       string   `json:"device_id"`
+	FavoritesOrder []string `json:"favorites_order,omitempty"` // station IDs, manual order
 }
 
 // Store reads/writes config + state under a directory (the XDG config dir in

@@ -6,6 +6,8 @@ package library
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -30,6 +32,7 @@ var defaultSkip = pocketcasts.Skip{Back: 10, Forward: 45}
 type NowPlaying struct {
 	Title    string // episode title or "Song — Artist"
 	Subtitle string // "Up Next" | "Live Stream" | podcast/station name
+	ArtURL   string // album art or station logo URL (empty if none)
 	Playing  bool
 	Position time.Duration
 	Duration time.Duration
@@ -53,6 +56,11 @@ func (NewestRelease) isTarget() {}
 type PlayStation struct{ Station radio.Station }
 
 func (PlayStation) isTarget() {}
+
+// UpNextAt plays the Up Next episode at the given queue index.
+type UpNextAt struct{ Index int }
+
+func (UpNextAt) isTarget() {}
 
 // Auth abstracts the credential/token resolution the engine needs. Tests inject
 // a fake; production uses the config.Store-backed implementation below.
@@ -78,17 +86,24 @@ type Engine struct {
 
 	subs []chan NowPlaying
 
+	// playMu serializes PlayTarget calls so rapid source-switching never races
+	// on player.Load or engine state. playCancel cancels the in-flight load.
+	playMu     sync.Mutex
+	playCancel context.CancelFunc
+
 	// pmu guards the podcast playback state below.
-	pmu         sync.Mutex
-	queue       []pocketcasts.Episode
-	idx         int
-	current     pocketcasts.Episode
-	hasCurrent  bool
-	lastSaveAt  time.Time
-	lastSavePos time.Duration
-	skip        pocketcasts.Skip
-	infoCache   map[string]map[string]pocketcasts.PlaybackInfo // podcastUUID → uuid → info
-	clock       func() time.Time
+	pmu           sync.Mutex
+	queue         []pocketcasts.Episode
+	idx           int
+	current       pocketcasts.Episode
+	hasCurrent    bool
+	lastSaveAt    time.Time
+	lastSavePos   time.Duration
+	skip          pocketcasts.Skip
+	infoCache     map[string]map[string]pocketcasts.PlaybackInfo // podcastUUID → uuid → info
+	clock         func() time.Time
+	currentTarget Target // last target passed to PlayTarget
+	stagedTarget  Target // pending selection (nil = none)
 }
 
 // Option configures an Engine at construction.
@@ -140,20 +155,120 @@ func (e *Engine) State() NowPlaying {
 }
 
 // PlayTarget resolves t to a Source and starts playback.
+// Concurrent calls are serialized: a newer call cancels the in-flight one and
+// waits for it to finish before proceeding.
 func (e *Engine) PlayTarget(ctx context.Context, t Target) error {
+	slog.Debug("PlayTarget.request", "target", fmt.Sprintf("%T", t))
+
+	// Register this call as the intended target and cancel any in-flight load.
+	e.pmu.Lock()
+	e.currentTarget = t
+	e.stagedTarget = nil
+	if e.playCancel != nil {
+		slog.Debug("PlayTarget.cancelling_previous")
+		e.playCancel()
+	}
+	playCtx, cancel := context.WithCancel(ctx)
+	e.playCancel = cancel
+	e.pmu.Unlock()
+
+	// Serialize: wait for any prior PlayTarget to finish.
+	e.playMu.Lock()
+	defer e.playMu.Unlock()
+
+	// If a newer call already superseded us, bail out.
+	e.pmu.Lock()
+	stillCurrent := e.currentTarget == t
+	e.pmu.Unlock()
+	if !stillCurrent {
+		slog.Debug("PlayTarget.superseded", "target", fmt.Sprintf("%T", t))
+		cancel()
+		return nil
+	}
+
+	slog.Info("PlayTarget.start", "target", fmt.Sprintf("%T", t))
 	switch tt := t.(type) {
 	case UpNextTop:
-		return e.playUpNextTop(ctx)
+		err := e.playUpNextTop(playCtx)
+		if err != nil {
+			slog.Error("PlayTarget.upnext_failed", "err", err)
+		}
+		return err
 	case PlayStation:
-		return e.playStation(tt.Station)
+		err := e.playStation(tt.Station)
+		if err != nil {
+			slog.Error("PlayTarget.station_failed", "station", tt.Station.Name, "err", err)
+		}
+		return err
+	case UpNextAt:
+		err := e.playUpNextAt(playCtx, tt.Index)
+		if err != nil {
+			slog.Error("PlayTarget.upnext_at_failed", "index", tt.Index, "err", err)
+		}
+		return err
 	case NewestRelease:
-		return errors.New("New Releases playback lands in M5")
+		err := e.playNewestRelease(playCtx)
+		if err != nil {
+			slog.Error("PlayTarget.newest_release_failed", "err", err)
+		}
+		return err
 	default:
+		cancel()
 		return errors.New("unsupported target")
 	}
 }
 
+// StageTarget marks t as the next source to play without starting playback.
+// A subsequent TogglePlayback will switch to it when it differs from the current source.
+func (e *Engine) StageTarget(t Target) {
+	slog.Debug("StageTarget", "target", fmt.Sprintf("%T", t))
+	e.pmu.Lock()
+	e.stagedTarget = t
+	e.pmu.Unlock()
+}
+
+// StagedTarget returns the currently staged target, or nil if none.
+func (e *Engine) StagedTarget() Target {
+	e.pmu.Lock()
+	defer e.pmu.Unlock()
+	return e.stagedTarget
+}
+
+// CurrentTarget returns the target that is currently loaded/playing, or nil if
+// nothing has been played yet.
+func (e *Engine) CurrentTarget() Target {
+	e.pmu.Lock()
+	defer e.pmu.Unlock()
+	return e.currentTarget
+}
+
 // ---- Podcast playback (Up Next) ----
+
+// UpNextList fetches the current Up Next queue without changing playback. The
+// full TUI uses it to render the Up Next tab.
+func (e *Engine) UpNextList(ctx context.Context) ([]pocketcasts.Episode, error) {
+	return e.fetchUpNext(ctx)
+}
+
+// playUpNextAt fetches Up Next and starts playback at queue index i.
+func (e *Engine) playUpNextAt(ctx context.Context, i int) error {
+	e.stopTracklist()
+	episodes, err := e.fetchUpNext(ctx)
+	if err != nil {
+		return err
+	}
+	if i < 0 || i >= len(episodes) {
+		return errors.New("up next index out of range")
+	}
+
+	e.pmu.Lock()
+	e.queue = episodes
+	e.idx = i
+	e.pmu.Unlock()
+
+	go e.refreshSkipSettings(context.Background())
+	return e.playEpisodeAt(ctx, i)
+}
 
 func (e *Engine) playUpNextTop(ctx context.Context) error {
 	e.stopTracklist()
@@ -183,6 +298,7 @@ func (e *Engine) playEpisodeAt(ctx context.Context, i int) error {
 	}
 	ep := e.queue[i]
 	e.pmu.Unlock()
+	slog.Info("playEpisodeAt", "index", i, "title", ep.Title, "played_up_to", ep.PlayedUpTo, "duration", ep.Duration)
 
 	if ep.URL == "" {
 		return errors.New("episode has no playable URL")
@@ -214,11 +330,66 @@ func (e *Engine) playEpisodeAt(ctx context.Context, i int) error {
 	e.update(func(n *NowPlaying) {
 		n.Title = ep.Title
 		n.Subtitle = "Up Next"
+		n.ArtURL = podcastArtURL(ep.PodcastUUID)
 		n.Playing = true
 		n.Position = resume
 		n.Duration = time.Duration(ep.Duration) * time.Second
 		n.IsLive = false
 	})
+	return nil
+}
+
+// newReleaseDays is the look-back window for the New Releases list.
+const newReleaseDays = 14
+
+// playNewestRelease fetches the New Releases list, plays the newest episode, and
+// bubbles it to the server-side Up Next via PlayNow.
+func (e *Engine) playNewestRelease(ctx context.Context) error {
+	e.stopTracklist()
+
+	var releases []pocketcasts.NewRelease
+	err := e.withToken(ctx, func(token string) error {
+		var err error
+		releases, err = e.api.NewReleases(ctx, token, newReleaseDays)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if len(releases) == 0 {
+		return errors.New("no new releases")
+	}
+
+	r := releases[0]
+	ep := pocketcasts.Episode{
+		UUID:        r.UUID,
+		Title:       r.Title,
+		URL:         r.URL,
+		PodcastUUID: r.PodcastUUID,
+		Duration:    r.Duration,
+		Published:   r.Published,
+	}
+
+	// Bubble the newest release into the server-side Up Next queue.
+	go func() {
+		_ = e.withToken(context.Background(), func(token string) error {
+			return e.api.PlayNow(context.Background(), token, e.auth.DeviceID(), ep)
+		})
+	}()
+
+	e.pmu.Lock()
+	e.queue = []pocketcasts.Episode{ep}
+	e.idx = 0
+	e.pmu.Unlock()
+
+	go e.refreshSkipSettings(context.Background())
+	if err := e.playEpisodeAt(ctx, 0); err != nil {
+		return err
+	}
+	// New Releases label the podcast rather than the queue.
+	if r.PodcastTitle != "" {
+		e.update(func(n *NowPlaying) { n.Subtitle = r.PodcastTitle })
+	}
 	return nil
 }
 
@@ -317,6 +488,7 @@ func (e *Engine) saveProgress(ctx context.Context, ep pocketcasts.Episode, pos t
 func (e *Engine) completeAndAdvance() {
 	e.pmu.Lock()
 	if !e.hasCurrent {
+		slog.Debug("completeAndAdvance.no_current_skipped")
 		e.pmu.Unlock()
 		return
 	}
@@ -325,6 +497,7 @@ func (e *Engine) completeAndAdvance() {
 	e.hasCurrent = false
 	e.pmu.Unlock()
 
+	slog.Info("completeAndAdvance", "completed", cur.Title, "next_index", next)
 	dur := time.Duration(cur.Duration) * time.Second
 	e.saveProgress(context.Background(), cur, dur, pocketcasts.StatusCompleted)
 	_ = e.withToken(context.Background(), func(token string) error {
@@ -335,15 +508,18 @@ func (e *Engine) completeAndAdvance() {
 	hasNext := next < len(e.queue)
 	e.pmu.Unlock()
 	if hasNext {
+		slog.Info("completeAndAdvance.advancing", "next_index", next)
 		_ = e.playEpisodeAt(context.Background(), next)
 		return
 	}
+	slog.Info("completeAndAdvance.queue_empty")
 	e.update(func(n *NowPlaying) { n.Playing = false })
 }
 
 // ---- Radio (station) playback ----
 
 func (e *Engine) playStation(st radio.Station) error {
+	slog.Info("playStation", "name", st.Name, "url", st.StreamURL, "logo", st.LogoURL)
 	e.stopTracklist()
 	e.pmu.Lock()
 	e.hasCurrent = false // leaving podcast context; no write-back for stations
@@ -351,12 +527,14 @@ func (e *Engine) playStation(st radio.Station) error {
 	if st.StreamURL == "" {
 		return errors.New("station has no stream URL")
 	}
+	slog.Debug("playStation.load", "url", st.StreamURL)
 	if err := e.player.Load(st.StreamURL, 0); err != nil {
 		return err
 	}
 	e.update(func(n *NowPlaying) {
 		n.Title = st.Name
 		n.Subtitle = st.Name
+		n.ArtURL = st.LogoURL
 		n.Playing = true
 		n.Position = 0
 		n.Duration = 0
@@ -442,9 +620,39 @@ func (e *Engine) withToken(ctx context.Context, fn func(token string) error) err
 
 // ---- Transport ----
 
-// TogglePlayback flips play/pause, saving progress (or completing) on pause.
+// TogglePlayback flips play/pause. If a staged target different from the current
+// source is set, switches to that source instead.
 func (e *Engine) TogglePlayback() {
-	if !e.player.State().Playing {
+	e.pmu.Lock()
+	staged := e.stagedTarget
+	current := e.currentTarget
+	e.pmu.Unlock()
+
+	if staged != nil && staged != current {
+		slog.Info("TogglePlayback.switch_source",
+			"from", fmt.Sprintf("%T", current),
+			"to", fmt.Sprintf("%T", staged))
+		e.pmu.Lock()
+		e.stagedTarget = nil
+		e.pmu.Unlock()
+		go func() { _ = e.PlayTarget(context.Background(), staged) }()
+		return
+	}
+
+	// Use engine's intent state, not raw mpv state. mpv can flip pause on live
+	// stream reconnects, making player.State().Playing unreliable.
+	e.mu.RLock()
+	playing := e.now.Playing
+	e.mu.RUnlock()
+	slog.Debug("TogglePlayback", "intent_playing", playing)
+	if !playing {
+		// Live/continuous streams aren't buffered while paused, so "play" reloads
+		// the source from the live edge rather than resuming stale audio.
+		if e.isLive() && current != nil {
+			slog.Info("TogglePlayback.live_reload")
+			go func() { _ = e.PlayTarget(context.Background(), current) }()
+			return
+		}
 		_ = e.player.Resume()
 		e.update(func(n *NowPlaying) { n.Playing = true })
 		return
@@ -538,23 +746,40 @@ func (e *Engine) pump() {
 				if st.Duration > 0 {
 					n.Duration = st.Duration
 				}
-				n.Playing = st.Playing
+				// Do NOT update Playing from Tick: engine intent (set by
+				// Pause/Resume/PlayTarget) is authoritative. Live streams can
+				// auto-reconnect and flip mpv's pause state unexpectedly.
 				n.IsLive = st.IsLive
 			})
 			if st.Playing {
 				e.maybeSave(false, pocketcasts.StatusInProgress)
 			}
 		case player.Metadata:
-			if title := ev.Metadata["icy-title"]; title != "" {
+			title := ev.Metadata["icy-title"]
+			slog.Debug("pump.metadata", "icy_title", title)
+			if title != "" {
 				e.update(func(n *NowPlaying) { n.Title = title })
 			}
 		case player.Ended:
+			live := e.isLive()
+			slog.Info("pump.ended", "is_live", live)
 			e.update(func(n *NowPlaying) { n.Playing = false })
-			if !e.isLive() {
+			if !live {
 				e.completeAndAdvance()
 			}
+		case player.Error:
+			slog.Error("pump.player_error", "err", ev.Err)
 		}
 	}
+	slog.Info("pump.events_channel_closed")
+}
+
+// podcastArtURL returns the Pocket Casts CDN artwork URL for a podcast UUID.
+func podcastArtURL(podcastUUID string) string {
+	if podcastUUID == "" {
+		return ""
+	}
+	return "https://static.pocketcasts.com/discover/images/280/" + podcastUUID + ".jpg"
 }
 
 // update mutates NowPlaying under lock and broadcasts to subscribers.
