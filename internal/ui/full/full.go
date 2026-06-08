@@ -93,7 +93,13 @@ type Model struct {
 	browseErr    error
 	browseLoaded bool
 	favIDs       map[string]bool // station IDs currently favorited
+
+	searchQuery string
+	searchDeb   *searchDebouncer
 }
+
+// searchWindow is the debounce window for Browse search.
+const searchWindow = 300 * time.Millisecond
 
 const (
 	tabUpNext = iota
@@ -132,6 +138,10 @@ type browseMsg struct {
 	err      error
 }
 
+// searchTickMsg fires `searchWindow` after a query edit; the debouncer decides
+// whether enough quiet time has passed to actually search.
+type searchTickMsg struct{}
+
 // New builds a full Model. streams is the list of favorite stations to show as
 // pills (capped at 3). Call tea.NewProgram with tea.WithAltScreen().
 func New(e Engine, streams []radio.Station) Model {
@@ -151,9 +161,10 @@ func New(e Engine, streams []radio.Station) Model {
 		sub:      e.Subscribe(),
 		artCache: art.NewCache(),
 		proto:    art.Detect(),
-		width:    80,
-		height:   24,
-		favIDs:   map[string]bool{},
+		width:     80,
+		height:    24,
+		favIDs:    map[string]bool{},
+		searchDeb: newSearchDebouncer(searchWindow, nil),
 	}
 }
 
@@ -286,7 +297,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.browseSel = clamp(m.browseSel, len(m.browse))
 		slog.Debug("full.browse", "count", len(m.browse), "err", msg.err)
 
+	case searchTickMsg:
+		if q, ok := m.searchDeb.Fire(); ok {
+			return m, m.runSearch(q)
+		}
+		return m, nil
+
 	case tea.KeyMsg:
+		// In the Browse search field, printable keys edit the query; only the
+		// keys below (nav, tabs, quit, favorite) keep their command meaning.
+		if m.inSearch() {
+			if cmd, handled := m.searchInput(msg); handled {
+				return m, cmd
+			}
+		}
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
 			return m, tea.Quit
@@ -311,7 +335,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "shift+up", "shift+down":
 			return m, m.reorderFavorite(map[bool]int{true: -1, false: 1}[msg.String() == "shift+up"])
-		case "f":
+		case "f", "ctrl+f": // ctrl+f works while typing in the search field
 			return m, m.toggleFavorite()
 		case " ":
 			if m.engine.CurrentTarget() == nil {
@@ -344,6 +368,56 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// inSearch reports whether the Browse search field has focus.
+func (m Model) inSearch() bool { return m.browseSelected() && m.radioTab == radioBrowse }
+
+// searchInput handles a keypress while the Browse search field is focused. It
+// returns (cmd, true) when it consumed the key as text editing; (nil, false)
+// lets the key keep its normal command meaning (nav, tabs, quit, ctrl+f, etc.).
+func (m *Model) searchInput(msg tea.KeyMsg) (tea.Cmd, bool) {
+	switch msg.String() {
+	case "[", "]", "enter", "up", "down", "left", "right",
+		"tab", "shift+tab", "esc", "ctrl+c", "ctrl+f":
+		return nil, false // keep command meaning
+	}
+	switch msg.Type {
+	case tea.KeyBackspace:
+		if r := []rune(m.searchQuery); len(r) > 0 {
+			m.searchQuery = string(r[:len(r)-1])
+			return m.editSearch(), true
+		}
+		return nil, true
+	case tea.KeySpace:
+		m.searchQuery += " "
+		return m.editSearch(), true
+	case tea.KeyRunes:
+		m.searchQuery += string(msg.Runes)
+		return m.editSearch(), true
+	}
+	return nil, false
+}
+
+// editSearch records the query edit and schedules a debounce tick.
+func (m *Model) editSearch() tea.Cmd {
+	m.searchDeb.Edit(m.searchQuery)
+	return tea.Tick(searchWindow, func(time.Time) tea.Msg { return searchTickMsg{} })
+}
+
+// runSearch queries the radio service; an empty query falls back to top stations.
+func (m Model) runSearch(query string) tea.Cmd {
+	if m.radio == nil {
+		return nil
+	}
+	if strings.TrimSpace(query) == "" {
+		return m.fetchBrowse()
+	}
+	svc := m.radio
+	return func() tea.Msg {
+		st, err := svc.Search(context.Background(), query)
+		return browseMsg{stations: st, err: err}
+	}
 }
 
 // selectPill highlights pill idx, stages its (non-nil) target, and lazy-loads
@@ -551,7 +625,11 @@ func (m Model) View() string {
 		b.WriteString(m.radioTabsRow())
 		b.WriteString("\n")
 		b.WriteString(m.radioSection())
-		hint = "q quit · tab select · [ ] tabs · ↑↓ move · enter play · f ♥ · ⇧↑↓ reorder"
+		if m.radioTab == radioBrowse {
+			hint = "type to search · ↑↓ move · enter play · ^f ♥ · [ ] tabs · esc quit"
+		} else {
+			hint = "esc quit · [ ] tabs · ↑↓ move · enter play · f ♥ · ⇧↑↓ reorder"
+		}
 	}
 
 	b.WriteString(divider(m.width))
@@ -573,23 +651,29 @@ func (m Model) radioSection() string {
 	if m.radio == nil {
 		return theme.MutedStyle.Render("  Radio unavailable") + "\n"
 	}
+
+	var b strings.Builder
 	stations, sel, err, loaded := m.favorites, m.favSel, m.favErr, m.favLoaded
 	empty := "  No favorites yet — press f on a Browse station"
 	if m.radioTab == radioBrowse {
 		stations, sel, err, loaded = m.browse, m.browseSel, m.browseErr, m.browseLoaded
 		empty = "  No stations"
+		// Search field (always visible in the Browse tab).
+		b.WriteString("  ")
+		b.WriteString(theme.SubtitleStyle.Render("Search: "))
+		b.WriteString(theme.TitleStyle.Render(m.searchQuery))
+		b.WriteString(theme.AccentStyle.Render("▌"))
+		b.WriteString("\n")
 	}
-	if err != nil {
-		return theme.MutedStyle.Render("  Unavailable") + "\n"
-	}
-	if !loaded {
-		return theme.MutedStyle.Render("  Loading…") + "\n"
-	}
-	if len(stations) == 0 {
-		return theme.MutedStyle.Render(empty) + "\n"
+	switch {
+	case err != nil:
+		return b.String() + theme.MutedStyle.Render("  Unavailable") + "\n"
+	case !loaded:
+		return b.String() + theme.MutedStyle.Render("  Loading…") + "\n"
+	case len(stations) == 0:
+		return b.String() + theme.MutedStyle.Render(empty) + "\n"
 	}
 
-	var b strings.Builder
 	visible := m.height - 16
 	if visible < 3 {
 		visible = 3

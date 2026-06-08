@@ -313,6 +313,51 @@ func TestRadioPanelFavoritesReorderPlay(t *testing.T) {
 	}
 }
 
+// Browse search: typing edits the query and a debounce tick collapses to a
+// single Search call with the final query.
+func TestBrowseSearchDebounced(t *testing.T) {
+	fe := newFake(library.NowPlaying{})
+	fr := &fakeRadio{
+		favs:   []radio.Station{{ID: "a", Name: "Alpha"}},
+		browse: []radio.Station{{ID: "k", Name: "KEXP"}},
+	}
+	m := New(fe, nil).WithRadio(fr)
+	m.width, m.height = 80, 30
+
+	// Go to Browse pill, then the Browse sub-tab.
+	m = mustModel(m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("2")}))
+	m = mustModel(m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("]")}))
+	if !m.inSearch() {
+		t.Fatal("not in Browse search context")
+	}
+
+	// Type "kx" — each rune edits the query (and schedules a tick).
+	m = mustModel(m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")}))
+	m = mustModel(m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")}))
+	if m.searchQuery != "kx" {
+		t.Fatalf("searchQuery = %q, want kx", m.searchQuery)
+	}
+	if !strings.Contains(m.View(), "Search: kx") {
+		t.Errorf("search field not rendered: %q", m.View())
+	}
+
+	// The debounce window must elapse before a tick fires the search. Wait it
+	// out, then deliver the tick; it should run Search and populate results.
+	time.Sleep(searchWindow + 20*time.Millisecond)
+	_, cmd := m.Update(searchTickMsg{})
+	if cmd == nil {
+		t.Fatal("tick after window did not fire search")
+	}
+	msg := cmd() // executes the Search call
+	bm, ok := msg.(browseMsg)
+	if !ok {
+		t.Fatalf("search produced %T, want browseMsg", msg)
+	}
+	if len(bm.stations) != 1 || bm.stations[0].ID != "k" {
+		t.Fatalf("search results = %v", bm.stations)
+	}
+}
+
 // Behavior 5 (engine): staging sets StagedTarget without starting playback.
 func TestEngineStagingDoesNotChangeCurrent(t *testing.T) {
 	// This test lives in the full package as an integration check;
