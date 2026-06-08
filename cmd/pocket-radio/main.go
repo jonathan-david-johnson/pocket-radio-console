@@ -11,36 +11,52 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"sort"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"pocket-radio-console/internal/applog"
 	"pocket-radio-console/internal/config"
 	"pocket-radio-console/internal/library"
 	"pocket-radio-console/internal/player"
 	"pocket-radio-console/internal/pocketcasts"
 	"pocket-radio-console/internal/radio"
 	"pocket-radio-console/internal/resolver"
+	"pocket-radio-console/internal/ui/full"
 	"pocket-radio-console/internal/ui/mini"
 )
 
 func main() {
 	var (
-		list    bool
-		full    bool
-		posArgs []string
+		list      bool
+		full      bool
+		debugFile string
+		posArgs   []string
 	)
 	for _, a := range os.Args[1:] {
-		switch a {
-		case "--list":
+		switch {
+		case a == "--list":
 			list = true
-		case "--full":
+		case a == "--full":
 			full = true
+		case a == "--debug":
+			debugFile = "debug.log"
+		case strings.HasPrefix(a, "--debug="):
+			debugFile = strings.TrimPrefix(a, "--debug=")
 		default:
 			posArgs = append(posArgs, a)
 		}
 	}
+
+	closer, err := applog.Init(debugFile, slog.LevelDebug)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error opening debug log:", err)
+		os.Exit(1)
+	}
+	defer closer.Close()
 
 	if list {
 		if err := runList(); err != nil {
@@ -49,8 +65,9 @@ func main() {
 		return
 	}
 	if full || len(posArgs) == 0 {
-		fmt.Fprintln(os.Stderr, "Full TUI is not built yet (milestone M4).")
-		fmt.Fprintln(os.Stderr, "Try: pocket-radio up_next  |  pocket-radio kcrw")
+		if err := runFull(); err != nil {
+			fail(err)
+		}
 		return
 	}
 	if err := runMini(posArgs[0]); err != nil {
@@ -139,11 +156,53 @@ func runList() error {
 	return nil
 }
 
-// runMini resolves arg and plays the result in mini mode.
-func runMini(arg string) error {
+// runFull opens the full alt-screen TUI without auto-starting playback.
+func runFull() error {
+	slog.Info("mode: full TUI")
 	ctx := context.Background()
 	d, err := setup(ctx)
 	if err != nil {
+		slog.Error("setup failed", "err", err)
+		return err
+	}
+	return launchFull(ctx, d, nil)
+}
+
+// launchFull starts the full TUI, optionally reusing an existing engine.
+func launchFull(ctx context.Context, d *deps, eng *library.Engine) error {
+	favs, err := d.radio.Favorites(ctx, d.auth.UserUUID())
+	if err != nil {
+		slog.Warn("favorites fetch failed", "err", err)
+	}
+	slog.Info("favorites loaded", "count", len(favs))
+	streams := favs
+	if len(streams) > 3 {
+		streams = streams[:3]
+	}
+	if eng == nil {
+		p, err := player.New()
+		if err != nil {
+			return err
+		}
+		eng = library.New(d.api, p, d.auth, library.WithTracklister(d.radio))
+		defer eng.Close()
+	}
+	model := full.New(eng, streams)
+	_, runErr := tea.NewProgram(model,
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+	).Run()
+	return runErr
+}
+
+// runMini resolves arg and plays the result in mini mode.
+// If the user presses 'f', the full TUI is launched with the same engine.
+func runMini(arg string) error {
+	slog.Info("mode: mini", "arg", arg)
+	ctx := context.Background()
+	d, err := setup(ctx)
+	if err != nil {
+		slog.Error("setup failed", "err", err)
 		return err
 	}
 
@@ -163,8 +222,14 @@ func runMini(arg string) error {
 		return err
 	}
 
-	_, err = tea.NewProgram(mini.New(engine)).Run()
-	return err
+	m, err := tea.NewProgram(mini.New(engine)).Run()
+	if err != nil {
+		return err
+	}
+	if mm, ok := m.(mini.Model); ok && mm.WantFull {
+		return launchFull(ctx, d, engine)
+	}
+	return nil
 }
 
 // resolveTarget maps a mini-mode argument to a library.Target.

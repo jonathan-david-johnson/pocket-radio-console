@@ -34,9 +34,10 @@ type nowMsg library.NowPlaying
 
 // Model is the Bubble Tea model.
 type Model struct {
-	engine Engine
-	now    library.NowPlaying
-	sub    <-chan library.NowPlaying
+	engine   Engine
+	now      library.NowPlaying
+	sub      <-chan library.NowPlaying
+	WantFull bool // set to true when 'f' is pressed; caller may launch the full TUI
 }
 
 // New returns a mini Model bound to engine.
@@ -68,6 +69,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
+			return m, tea.Quit
+		case "f":
+			m.WantFull = true
 			return m, tea.Quit
 		case " ":
 			m.engine.TogglePlayback()
