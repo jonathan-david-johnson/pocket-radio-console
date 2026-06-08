@@ -2,6 +2,7 @@ package library
 
 import (
 	"testing"
+	"time"
 
 	"pocket-radio-console/internal/pocketcasts"
 )
@@ -49,6 +50,28 @@ func TestEpisodeTimeRemaining(t *testing.T) {
 		if got := EpisodeTimeRemaining(c.ep, c.playing); got != c.want {
 			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
 		}
+	}
+}
+
+func TestRelativeDate(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		ago  time.Duration
+		want string
+	}{
+		{30 * time.Second, "just now"},
+		{5 * time.Minute, "5m ago"},
+		{3 * time.Hour, "3h ago"},
+		{2 * 24 * time.Hour, "2d ago"},
+		{30 * 24 * time.Hour, "May 9"},
+	}
+	for _, c := range cases {
+		if got := RelativeDate(now.Add(-c.ago), now); got != c.want {
+			t.Errorf("ago=%v: got %q, want %q", c.ago, got, c.want)
+		}
+	}
+	if got := RelativeDate(time.Time{}, now); got != "" {
+		t.Errorf("zero time: got %q, want empty", got)
 	}
 }
 

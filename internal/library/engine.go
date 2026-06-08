@@ -62,6 +62,11 @@ type UpNextAt struct{ Index int }
 
 func (UpNextAt) isTarget() {}
 
+// PlayRelease plays a specific New Release episode.
+type PlayRelease struct{ Release pocketcasts.NewRelease }
+
+func (PlayRelease) isTarget() {}
+
 // Auth abstracts the credential/token resolution the engine needs. Tests inject
 // a fake; production uses the config.Store-backed implementation below.
 type Auth interface {
@@ -212,6 +217,12 @@ func (e *Engine) PlayTarget(ctx context.Context, t Target) error {
 			slog.Error("PlayTarget.newest_release_failed", "err", err)
 		}
 		return err
+	case PlayRelease:
+		err := e.playRelease(playCtx, tt.Release)
+		if err != nil {
+			slog.Error("PlayTarget.release_failed", "title", tt.Release.Title, "err", err)
+		}
+		return err
 	default:
 		cancel()
 		return errors.New("unsupported target")
@@ -344,23 +355,33 @@ const newReleaseDays = 14
 
 // playNewestRelease fetches the New Releases list, plays the newest episode, and
 // bubbles it to the server-side Up Next via PlayNow.
-func (e *Engine) playNewestRelease(ctx context.Context) error {
-	e.stopTracklist()
-
-	var releases []pocketcasts.NewRelease
+// NewReleases fetches the New Releases list without changing playback. The full
+// TUI uses it to render the New Releases tab.
+func (e *Engine) NewReleases(ctx context.Context) ([]pocketcasts.NewRelease, error) {
+	var rel []pocketcasts.NewRelease
 	err := e.withToken(ctx, func(token string) error {
 		var err error
-		releases, err = e.api.NewReleases(ctx, token, newReleaseDays)
+		rel, err = e.api.NewReleases(ctx, token, newReleaseDays)
 		return err
 	})
+	return rel, err
+}
+
+func (e *Engine) playNewestRelease(ctx context.Context) error {
+	releases, err := e.NewReleases(ctx)
 	if err != nil {
 		return err
 	}
 	if len(releases) == 0 {
 		return errors.New("no new releases")
 	}
+	return e.playRelease(ctx, releases[0])
+}
 
-	r := releases[0]
+// playRelease plays a single New Release and bubbles it to the server-side Up
+// Next via PlayNow.
+func (e *Engine) playRelease(ctx context.Context, r pocketcasts.NewRelease) error {
+	e.stopTracklist()
 	ep := pocketcasts.Episode{
 		UUID:        r.UUID,
 		Title:       r.Title,
@@ -370,7 +391,7 @@ func (e *Engine) playNewestRelease(ctx context.Context) error {
 		Published:   r.Published,
 	}
 
-	// Bubble the newest release into the server-side Up Next queue.
+	// Bubble the release into the server-side Up Next queue.
 	go func() {
 		_ = e.withToken(context.Background(), func(token string) error {
 			return e.api.PlayNow(context.Background(), token, e.auth.DeviceID(), ep)

@@ -2,9 +2,31 @@ package library
 
 import (
 	"fmt"
+	"time"
 
 	"pocket-radio-console/internal/pocketcasts"
 )
+
+// RelativeDate renders a publish time relative to now: "Xm ago" within the hour,
+// "Xh ago" within a day, "Xd ago" within a week, else an absolute "Jan 2" date.
+func RelativeDate(t, now time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	d := now.Sub(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	case d < 7*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(d.Hours())/24)
+	default:
+		return t.Format("Jan 2")
+	}
+}
 
 // FormatDuration renders a second count the way the menubar does:
 //

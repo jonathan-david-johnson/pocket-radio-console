@@ -4,6 +4,7 @@ import (
 	"context"
 	"image"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,12 +18,17 @@ import (
 
 // fakeEngine satisfies the Engine interface for tests.
 type fakeEngine struct {
-	now       library.NowPlaying
-	sub       chan library.NowPlaying
-	staged    library.Target
-	scrubs    []time.Duration
-	upNext    []pocketcasts.Episode
-	upNextErr error
+	now         library.NowPlaying
+	sub         chan library.NowPlaying
+	staged      library.Target
+	scrubs      []time.Duration
+	upNext      []pocketcasts.Episode
+	upNextErr   error
+	newReleases []pocketcasts.NewRelease
+	newRelErr   error
+
+	mu         sync.Mutex
+	lastTarget library.Target
 }
 
 func newFake(now library.NowPlaying) *fakeEngine {
@@ -40,11 +46,22 @@ func (f *fakeEngine) StageTarget(t library.Target)  { f.staged = t }
 func (f *fakeEngine) StagedTarget() library.Target  { return f.staged }
 func (f *fakeEngine) CurrentTarget() library.Target { return nil }
 func (f *fakeEngine) PlayTarget(_ context.Context, t library.Target) error {
+	f.mu.Lock()
+	f.lastTarget = t
 	f.now.Title = "switched"
+	f.mu.Unlock()
 	return nil
+}
+func (f *fakeEngine) target() library.Target {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastTarget
 }
 func (f *fakeEngine) UpNextList(_ context.Context) ([]pocketcasts.Episode, error) {
 	return f.upNext, f.upNextErr
+}
+func (f *fakeEngine) NewReleases(_ context.Context) ([]pocketcasts.NewRelease, error) {
+	return f.newReleases, f.newRelErr
 }
 
 // Behavior 6: View() contains the title and the correct play/pause glyph.
@@ -149,6 +166,54 @@ func TestViewInlineImageTitleNotDuplicated(t *testing.T) {
 	if got := strings.Count(m.View(), "1011: tmux + Terminal Maxxing"); got != 1 {
 		t.Errorf("title appears %d times in View(), want 1", got)
 	}
+}
+
+// New Releases tab: switching with "]" shows the release list; enter plays the
+// selected release via PlayRelease.
+func TestNewReleasesTab(t *testing.T) {
+	fe := newFake(library.NowPlaying{Title: "now"})
+	fe.newReleases = []pocketcasts.NewRelease{
+		{UUID: "r1", Title: "Episode One", PodcastTitle: "Pod A", Published: time.Now().Add(-2 * time.Hour)},
+		{UUID: "r2", Title: "Episode Two", PodcastTitle: "Pod B", Published: time.Now().Add(-26 * time.Hour)},
+	}
+	m := New(fe, nil)
+	m.width, m.height = 80, 30
+
+	// Switch to New Releases (Podcast pill is index 0, selected by default).
+	m2, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("]")})
+	fm := m2.(Model)
+	if fm.podcastTab != tabNewReleases {
+		t.Fatalf("podcastTab = %d, want New Releases", fm.podcastTab)
+	}
+	// Lazy load fires a cmd; run it and feed the message back.
+	if cmd == nil {
+		t.Fatal("expected lazy-load command")
+	}
+	fm2, _ := fm.Update(cmd())
+	fm = fm2.(Model)
+
+	view := fm.View()
+	if !strings.Contains(view, "Episode One") || !strings.Contains(view, "Pod A") {
+		t.Errorf("New Releases list not rendered: %q", view)
+	}
+
+	// Move to the second release and play it.
+	d, _ := fm.Update(tea.KeyMsg{Type: tea.KeyDown})
+	fm = d.(Model)
+	e, _ := fm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_ = e
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if pr, ok := fe.target().(library.PlayRelease); ok {
+			if pr.Release.UUID != "r2" {
+				t.Fatalf("played %q, want r2", pr.Release.UUID)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("PlayRelease not invoked")
 }
 
 // Behavior 5 (engine): staging sets StagedTarget without starting playback.

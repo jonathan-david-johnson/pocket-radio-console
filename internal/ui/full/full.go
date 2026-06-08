@@ -34,6 +34,7 @@ type Engine interface {
 	CurrentTarget() library.Target
 	PlayTarget(ctx context.Context, t library.Target) error
 	UpNextList(ctx context.Context) ([]pocketcasts.Episode, error)
+	NewReleases(ctx context.Context) ([]pocketcasts.NewRelease, error)
 }
 
 // Pill represents one source tab.
@@ -56,11 +57,23 @@ type Model struct {
 	width    int
 	height   int
 
-	// Up Next tab state (shown when the Podcast pill is selected).
-	upNext    []pocketcasts.Episode
-	upNextSel int
-	upNextErr error
+	// Podcast pane state (shown when the Podcast pill is selected). podcastTab
+	// toggles between the Up Next and New Releases sub-tabs.
+	podcastTab int // 0 = Up Next, 1 = New Releases
+	upNext     []pocketcasts.Episode
+	upNextSel  int
+	upNextErr  error
+
+	newReleases  []pocketcasts.NewRelease
+	newRelSel    int
+	newRelErr    error
+	newRelLoaded bool
 }
+
+const (
+	tabUpNext = iota
+	tabNewReleases
+)
 
 type nowMsg library.NowPlaying
 
@@ -71,6 +84,11 @@ type artMsg struct {
 
 type upNextMsg struct {
 	eps []pocketcasts.Episode
+	err error
+}
+
+type newReleasesMsg struct {
+	rel []pocketcasts.NewRelease
 	err error
 }
 
@@ -105,6 +123,13 @@ func (m Model) fetchUpNext() tea.Cmd {
 	return func() tea.Msg {
 		eps, err := m.engine.UpNextList(context.Background())
 		return upNextMsg{eps: eps, err: err}
+	}
+}
+
+func (m Model) fetchNewReleases() tea.Cmd {
+	return func() tea.Msg {
+		rel, err := m.engine.NewReleases(context.Background())
+		return newReleasesMsg{rel: rel, err: err}
 	}
 }
 
@@ -162,18 +187,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		slog.Debug("full.upNext", "count", len(m.upNext), "err", msg.err)
 
+	case newReleasesMsg:
+		m.newReleases = msg.rel
+		m.newRelErr = msg.err
+		m.newRelLoaded = true
+		if m.newRelSel >= len(m.newReleases) {
+			m.newRelSel = 0
+		}
+		slog.Debug("full.newReleases", "count", len(m.newReleases), "err", msg.err)
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
 			return m, tea.Quit
+		case "[", "]":
+			if m.podcastSelected() {
+				m.podcastTab = (m.podcastTab + 1) % 2
+				if m.podcastTab == tabNewReleases && !m.newRelLoaded {
+					return m, m.fetchNewReleases() // lazy load on first view
+				}
+			}
+			return m, nil
 		case "up", "k":
-			if m.podcastSelected() && m.upNextSel > 0 {
-				m.upNextSel--
+			if m.podcastSelected() {
+				m.moveSel(-1)
 			}
 			return m, nil
 		case "down", "j":
-			if m.podcastSelected() && m.upNextSel < len(m.upNext)-1 {
-				m.upNextSel++
+			if m.podcastSelected() {
+				m.moveSel(1)
 			}
 			return m, nil
 		case " ":
@@ -207,8 +249,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "enter":
 			target := m.pills[m.selected].Target
-			if m.podcastSelected() && len(m.upNext) > 0 {
-				target = library.UpNextAt{Index: m.upNextSel}
+			if m.podcastSelected() {
+				switch {
+				case m.podcastTab == tabUpNext && len(m.upNext) > 0:
+					target = library.UpNextAt{Index: m.upNextSel}
+				case m.podcastTab == tabNewReleases && len(m.newReleases) > 0:
+					target = library.PlayRelease{Release: m.newReleases[m.newRelSel]}
+				}
 			}
 			go func() {
 				_ = m.engine.PlayTarget(context.Background(), target)
@@ -216,6 +263,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// moveSel moves the selection cursor in the active podcast sub-tab by delta,
+// clamped to the list bounds.
+func (m *Model) moveSel(delta int) {
+	switch m.podcastTab {
+	case tabUpNext:
+		m.upNextSel = clamp(m.upNextSel+delta, len(m.upNext))
+	case tabNewReleases:
+		m.newRelSel = clamp(m.newRelSel+delta, len(m.newReleases))
+	}
+}
+
+func clamp(i, n int) int {
+	if i < 0 {
+		return 0
+	}
+	if n > 0 && i >= n {
+		return n - 1
+	}
+	return i
 }
 
 // View renders the full TUI layout.
@@ -279,21 +347,89 @@ func (m Model) View() string {
 	b.WriteString(m.transportRow())
 	b.WriteString("\n")
 
-	// ── Up Next list (Podcast tab) ───────────────────────────
+	// ── Podcast lists (Up Next / New Releases sub-tabs) ──────
 	if m.podcastSelected() {
 		b.WriteString(divider(m.width))
 		b.WriteString("\n")
-		b.WriteString(m.upNextSection())
+		b.WriteString(m.podcastTabsRow())
+		b.WriteString("\n")
+		if m.podcastTab == tabNewReleases {
+			b.WriteString(m.newReleasesSection())
+		} else {
+			b.WriteString(m.upNextSection())
+		}
 	}
 
 	b.WriteString(divider(m.width))
 	b.WriteString("\n")
 	hint := "q quit · tab/1-4 select · enter play · space ⏯ · ← → skip"
-	if m.podcastSelected() && len(m.upNext) > 0 {
-		hint = "q quit · tab select · ↑↓ move · enter play · space ⏯ · ← → skip"
+	if m.podcastSelected() {
+		hint = "q quit · tab select · [ ] tabs · ↑↓ move · enter play · space ⏯"
 	}
 	b.WriteString(theme.MutedStyle.Render(hint))
 
+	return b.String()
+}
+
+// podcastTabsRow renders the Up Next / New Releases sub-tab header.
+func (m Model) podcastTabsRow() string {
+	return "  " +
+		theme.PillStyle(m.podcastTab == tabUpNext).Render("Up Next") + " " +
+		theme.PillStyle(m.podcastTab == tabNewReleases).Render("New Releases")
+}
+
+// newReleasesSection renders the New Releases list: podcast title + episode +
+// relative publish date, selectable and scrollable.
+func (m Model) newReleasesSection() string {
+	if m.newRelErr != nil {
+		return theme.MutedStyle.Render("  New Releases unavailable") + "\n"
+	}
+	if !m.newRelLoaded {
+		return theme.MutedStyle.Render("  Loading…") + "\n"
+	}
+	if len(m.newReleases) == 0 {
+		return theme.MutedStyle.Render("  No releases in the last 14 days") + "\n"
+	}
+
+	var b strings.Builder
+	visible := m.height - 16
+	if visible < 3 {
+		visible = 3
+	}
+	start, end := scrollWindow(m.newRelSel, len(m.newReleases), visible)
+	now := time.Now()
+	for i := start; i < end; i++ {
+		r := m.newReleases[i]
+		cursor := "  "
+		if i == m.newRelSel {
+			cursor = theme.AccentStyle.Render("▸ ")
+		}
+		date := library.RelativeDate(r.Published, now)
+		titleW := m.width - 4 - len(date) - 1
+		if titleW < 10 {
+			titleW = 10
+		}
+		title := truncate(r.Title, titleW)
+		titleStyled := title
+		if i == m.newRelSel {
+			titleStyled = theme.TitleStyle.Render(title)
+		}
+		pad := m.width - 2 - lipgloss.Width(cursor) - lipgloss.Width(title) - len(date)
+		if pad < 1 {
+			pad = 1
+		}
+		b.WriteString(cursor)
+		b.WriteString(titleStyled)
+		b.WriteString(strings.Repeat(" ", pad))
+		b.WriteString(theme.MutedStyle.Render(date))
+		b.WriteString("\n")
+		// Second line: podcast title, dimmed.
+		if r.PodcastTitle != "" {
+			b.WriteString("  ")
+			b.WriteString(theme.SubtitleStyle.Render(truncate(r.PodcastTitle, m.width-4)))
+			b.WriteString("\n")
+		}
+	}
 	return b.String()
 }
 
