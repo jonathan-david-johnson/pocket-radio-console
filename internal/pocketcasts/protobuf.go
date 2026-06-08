@@ -115,3 +115,17 @@ func decodeInt32Value(data []byte) int {
 	})
 	return out
 }
+
+// firstSubmessage returns the bytes of the first length-delimited field matching
+// fieldNumber, or nil. Used to drill into nested wrapper submessages.
+func firstSubmessage(data []byte, fieldNumber int) []byte {
+	var out []byte
+	found := false
+	walkFields(data, func(f field) {
+		if !found && f.number == fieldNumber && f.wireType == 2 {
+			out = f.bytes
+			found = true
+		}
+	})
+	return out
+}

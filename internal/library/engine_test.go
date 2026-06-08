@@ -2,6 +2,7 @@ package library
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,6 +18,13 @@ type fakeAPI struct {
 	upNextResult []pocketcasts.Episode
 	upNextErrSeq []error // returned in order, then last repeats
 	session      pocketcasts.Session
+
+	mu           sync.Mutex
+	podcastInfos map[string][]pocketcasts.PlaybackInfo // podcastUUID → infos
+	updates      []pocketcasts.EpisodeUpdate
+	removed      []string // episode UUIDs removed from Up Next
+	playNow      []string
+	skip         pocketcasts.Skip
 }
 
 func (f *fakeAPI) Login(ctx context.Context, email, password string) (pocketcasts.Session, error) {
@@ -36,6 +44,59 @@ func (f *fakeAPI) UpNext(ctx context.Context, token, deviceID string) ([]pocketc
 		}
 	}
 	return f.upNextResult, nil
+}
+
+func (f *fakeAPI) PodcastEpisodes(ctx context.Context, token, podcastUUID string) ([]pocketcasts.PlaybackInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.podcastInfos[podcastUUID], nil
+}
+
+func (f *fakeAPI) UpdateEpisode(ctx context.Context, token string, u pocketcasts.EpisodeUpdate) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.updates = append(f.updates, u)
+	return nil
+}
+
+func (f *fakeAPI) PlayNow(ctx context.Context, token, deviceID string, ep pocketcasts.Episode) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.playNow = append(f.playNow, ep.UUID)
+	return nil
+}
+
+func (f *fakeAPI) RemoveFromUpNext(ctx context.Context, token, deviceID string, ep pocketcasts.Episode) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removed = append(f.removed, ep.UUID)
+	return nil
+}
+
+func (f *fakeAPI) SkipSettings(ctx context.Context, token string) (pocketcasts.Skip, error) {
+	return f.skip, nil
+}
+
+// helpers for assertions
+func (f *fakeAPI) updateCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.updates)
+}
+
+func (f *fakeAPI) lastUpdate() (pocketcasts.EpisodeUpdate, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.updates) == 0 {
+		return pocketcasts.EpisodeUpdate{}, false
+	}
+	return f.updates[len(f.updates)-1], true
+}
+
+func (f *fakeAPI) removedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.removed)
 }
 
 // fakeAuth implements Auth with controllable token + relogin.
@@ -128,7 +189,7 @@ func TestAuthReloginOn401(t *testing.T) {
 	}
 }
 
-// Behavior 7: SkipForward seeks by the default 45s.
+// SkipForward/Back use the default amounts (forward 45s, back 10s) until synced.
 func TestSkipForwardBack(t *testing.T) {
 	p := player.NewFake()
 	e := New(&fakeAPI{}, p, &fakeAuth{token: "t", hasToken: true})
@@ -140,11 +201,11 @@ func TestSkipForwardBack(t *testing.T) {
 		t.Fatalf("after skip forward: %v, want 145s", got)
 	}
 	e.SkipBack()
-	if got := p.State().Position; got != 100*time.Second {
-		t.Fatalf("after skip back: %v, want 100s", got)
+	if got := p.State().Position; got != 135*time.Second {
+		t.Fatalf("after skip back: %v, want 135s (back=10)", got)
 	}
 	// clamp at zero
-	_ = p.Seek(10 * time.Second)
+	_ = p.Seek(5 * time.Second)
 	e.SkipBack()
 	if got := p.State().Position; got != 0 {
 		t.Fatalf("skip back below zero: %v, want 0", got)

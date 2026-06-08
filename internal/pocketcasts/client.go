@@ -39,11 +39,49 @@ type Episode struct {
 	Published   time.Time // zero if unknown
 }
 
-// PocketCasts is the boundary interface the engine depends on. Only the M1
-// methods are implemented here; later milestones extend it.
+// PlaybackInfo is per-episode progress from /user/podcast/episodes.
+type PlaybackInfo struct {
+	UUID       string
+	PlayedUpTo int // seconds
+	Duration   int // seconds
+}
+
+// EpisodeStatus is the Pocket Casts playing status.
+type EpisodeStatus int
+
+const (
+	// StatusNotPlayed = 1.
+	StatusNotPlayed EpisodeStatus = 1
+	// StatusInProgress = 2.
+	StatusInProgress EpisodeStatus = 2
+	// StatusCompleted = 3.
+	StatusCompleted EpisodeStatus = 3
+)
+
+// EpisodeUpdate is a position write-back for /sync/update_episode.
+type EpisodeUpdate struct {
+	UUID        string
+	PodcastUUID string
+	Position    int // seconds
+	Duration    int // seconds
+	Status      EpisodeStatus
+}
+
+// Skip holds the user's synced skip amounts (seconds).
+type Skip struct {
+	Back    int
+	Forward int
+}
+
+// PocketCasts is the boundary interface the engine depends on.
 type PocketCasts interface {
 	Login(ctx context.Context, email, password string) (Session, error)
 	UpNext(ctx context.Context, token, deviceID string) ([]Episode, error)
+	PodcastEpisodes(ctx context.Context, token, podcastUUID string) ([]PlaybackInfo, error)
+	UpdateEpisode(ctx context.Context, token string, u EpisodeUpdate) error
+	PlayNow(ctx context.Context, token, deviceID string, ep Episode) error
+	RemoveFromUpNext(ctx context.Context, token, deviceID string, ep Episode) error
+	SkipSettings(ctx context.Context, token string) (Skip, error)
 }
 
 // Client is the concrete HTTP implementation of PocketCasts.
@@ -137,6 +175,169 @@ func (c *Client) UpNext(ctx context.Context, token, deviceID string) ([]Episode,
 	default:
 		return nil, fmt.Errorf("up_next: unexpected status %d", resp.StatusCode)
 	}
+}
+
+// PodcastEpisodes fetches per-episode progress for one podcast. This is where
+// the real playedUpTo/duration live (up_next/sync often reports 0).
+// Request Api_UuidRequest { v(1)="2", m(2)="mobile", uuid(3)=podcastUUID }.
+func (c *Client) PodcastEpisodes(ctx context.Context, token, podcastUUID string) ([]PlaybackInfo, error) {
+	body := encodeStringField(1, "2")
+	body = append(body, encodeStringField(2, "mobile")...)
+	body = append(body, encodeStringField(3, podcastUUID)...)
+
+	resp, err := c.post(ctx, "/user/podcast/episodes", token, body)
+	if err != nil {
+		return nil, fmt.Errorf("podcast episodes request: %w", err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		return decodeSyncEpisodes(data), nil
+	case http.StatusUnauthorized:
+		return nil, ErrInvalidCredentials
+	default:
+		return nil, fmt.Errorf("podcast episodes: status %d", resp.StatusCode)
+	}
+}
+
+// UpdateEpisode writes playback position back to Pocket Casts.
+// Api_UpdateEpisodeRequest { uuid(1), podcast(2), position(3 Int32Value),
+// status(4 varint), duration(5 varint) }.
+func (c *Client) UpdateEpisode(ctx context.Context, token string, u EpisodeUpdate) error {
+	body := encodeUpdateEpisode(u)
+	resp, err := c.post(ctx, "/sync/update_episode", token, body)
+	if err != nil {
+		return fmt.Errorf("update episode request: %w", err)
+	}
+	defer resp.Body.Close()
+	return statusErr(resp.StatusCode, "update episode")
+}
+
+// PlayNow bubbles an episode to the top of Up Next (change action=1).
+func (c *Client) PlayNow(ctx context.Context, token, deviceID string, ep Episode) error {
+	return c.upNextChange(ctx, token, deviceID, ep, 1)
+}
+
+// RemoveFromUpNext removes an episode from Up Next (change action=4).
+func (c *Client) RemoveFromUpNext(ctx context.Context, token, deviceID string, ep Episode) error {
+	return c.upNextChange(ctx, token, deviceID, ep, 4)
+}
+
+func (c *Client) upNextChange(ctx context.Context, token, deviceID string, ep Episode, action int64) error {
+	body := encodeUpNextChange(deviceID, ep, action)
+	resp, err := c.post(ctx, "/up_next/sync", token, body)
+	if err != nil {
+		return fmt.Errorf("up_next change request: %w", err)
+	}
+	defer resp.Body.Close()
+	return statusErr(resp.StatusCode, "up_next change")
+}
+
+// SkipSettings reads the user's synced skip amounts. The named_settings/update
+// endpoint returns current settings even with no settings to change, so sending
+// only the device field is effectively read-only.
+// Response { skipForward(5), skipBack(6) }, each Int32Setting{ value(1)=Int32Value }.
+func (c *Client) SkipSettings(ctx context.Context, token string) (Skip, error) {
+	body := encodeStringField(2, "PocketRadio")
+	resp, err := c.post(ctx, "/user/named_settings/update", token, body)
+	if err != nil {
+		return Skip{}, fmt.Errorf("named_settings request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return Skip{}, fmt.Errorf("named_settings: status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return Skip{}, err
+	}
+	return decodeSkipSettings(data), nil
+}
+
+func statusErr(code int, op string) error {
+	switch {
+	case code == http.StatusOK:
+		return nil
+	case code == http.StatusUnauthorized:
+		return ErrInvalidCredentials
+	default:
+		return fmt.Errorf("%s: status %d", op, code)
+	}
+}
+
+// encodeUpdateEpisode builds the /sync/update_episode body.
+func encodeUpdateEpisode(u EpisodeUpdate) []byte {
+	positionWrapper := encodeLengthDelimitedField(3, encodeVarintField(1, int64(u.Position)))
+	body := encodeStringField(1, u.UUID)
+	body = append(body, encodeStringField(2, u.PodcastUUID)...)
+	body = append(body, positionWrapper...)
+	body = append(body, encodeVarintField(4, int64(u.Status))...)
+	body = append(body, encodeVarintField(5, int64(u.Duration))...)
+	return body
+}
+
+// encodeUpNextChange builds an Api_UpNextSyncRequest carrying a single Change.
+// Change { uuid(1), action(2), modified(3), title(4), url(5), podcast(6) };
+// wrapped as Api_UpNextChanges{ changes(2) } under field 4 of the request.
+func encodeUpNextChange(deviceID string, ep Episode, action int64) []byte {
+	nowMillis := time.Now().UnixMilli()
+	change := encodeStringField(1, ep.UUID)
+	change = append(change, encodeVarintField(2, action)...)
+	change = append(change, encodeVarintField(3, nowMillis)...)
+	change = append(change, encodeStringField(4, ep.Title)...)
+	change = append(change, encodeStringField(5, ep.URL)...)
+	change = append(change, encodeStringField(6, ep.PodcastUUID)...)
+
+	upNextChanges := encodeLengthDelimitedField(2, change)
+
+	body := encodeVarintField(1, nowMillis)
+	body = append(body, encodeStringField(2, "2")...)
+	body = append(body, encodeLengthDelimitedField(4, upNextChanges)...)
+	body = append(body, encodeStringField(6, deviceID)...)
+	return body
+}
+
+// decodeSyncEpisodes parses Api_SyncEpisodesResponse { episodes(1) repeated }.
+// Each top-level EpisodeSyncResponse uses PLAIN int32 fields (not Int32Value):
+// uuid(1), playedUpTo(3 varint), duration(6 varint).
+func decodeSyncEpisodes(data []byte) []PlaybackInfo {
+	var out []PlaybackInfo
+	walkFields(data, func(f field) {
+		if f.number != 1 || f.wireType != 2 {
+			return
+		}
+		var info PlaybackInfo
+		walkFields(f.bytes, func(g field) {
+			switch {
+			case g.number == 1 && g.wireType == 2:
+				info.UUID = string(g.bytes)
+			case g.number == 3 && g.wireType == 0:
+				info.PlayedUpTo = int(g.varint)
+			case g.number == 6 && g.wireType == 0:
+				info.Duration = int(g.varint)
+			}
+		})
+		if info.UUID != "" {
+			out = append(out, info)
+		}
+	})
+	return out
+}
+
+// decodeSkipSettings unwraps forward(5)/back(6) Int32Setting{ Int32Value(1) }.
+func decodeSkipSettings(data []byte) Skip {
+	s := Skip{Back: 10, Forward: 45}
+	if fwd := firstSubmessage(firstSubmessage(data, 5), 1); fwd != nil {
+		s.Forward = decodeInt32Value(fwd)
+	}
+	if back := firstSubmessage(firstSubmessage(data, 6), 1); back != nil {
+		s.Back = decodeInt32Value(back)
+	}
+	return s
 }
 
 // encodeLoginRequest builds the POST /user/login body.

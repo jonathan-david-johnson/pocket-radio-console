@@ -1,6 +1,6 @@
 // Package library is THE ENGINE: the non-UI orchestration core. It owns the
 // Source, drives the Player, and emits NowPlaying state both UIs render. The Go
-// equivalent of the menubar's PlayerViewModel. M1 surface only.
+// equivalent of the menubar's PlayerViewModel.
 package library
 
 import (
@@ -14,11 +14,17 @@ import (
 	"pocket-radio-console/internal/radio"
 )
 
-// defaultSkip is the seek step until M3 wires synced skip settings.
-const defaultSkip = 45 * time.Second
+// saveInterval throttles position write-back: at most one save this often.
+const saveInterval = 30 * time.Second
+
+// completeThreshold: pausing/finishing with this little remaining counts as done.
+const completeThreshold = 10 * time.Second
 
 // tracklistInterval is how often the engine re-polls a station's tracklist.
 const tracklistInterval = 30 * time.Second
+
+// defaultSkip is used until the user's synced skip amounts are fetched.
+var defaultSkip = pocketcasts.Skip{Back: 10, Forward: 45}
 
 // NowPlaying is the single state struct both UIs render.
 type NowPlaying struct {
@@ -71,6 +77,18 @@ type Engine struct {
 	tlCancel context.CancelFunc // stops the running tracklist poller
 
 	subs []chan NowPlaying
+
+	// pmu guards the podcast playback state below.
+	pmu         sync.Mutex
+	queue       []pocketcasts.Episode
+	idx         int
+	current     pocketcasts.Episode
+	hasCurrent  bool
+	lastSaveAt  time.Time
+	lastSavePos time.Duration
+	skip        pocketcasts.Skip
+	infoCache   map[string]map[string]pocketcasts.PlaybackInfo // podcastUUID → uuid → info
+	clock       func() time.Time
 }
 
 // Option configures an Engine at construction.
@@ -81,9 +99,21 @@ func WithTracklister(t radio.Tracklister) Option {
 	return func(e *Engine) { e.tracklister = t }
 }
 
+// WithClock injects a clock for deterministic throttle tests.
+func WithClock(now func() time.Time) Option {
+	return func(e *Engine) { e.clock = now }
+}
+
 // New builds an Engine from its boundary dependencies.
 func New(api pocketcasts.PocketCasts, p player.Player, auth Auth, opts ...Option) *Engine {
-	e := &Engine{api: api, player: p, auth: auth}
+	e := &Engine{
+		api:       api,
+		player:    p,
+		auth:      auth,
+		skip:      defaultSkip,
+		infoCache: map[string]map[string]pocketcasts.PlaybackInfo{},
+		clock:     time.Now,
+	}
 	for _, opt := range opts {
 		opt(e)
 	}
@@ -123,9 +153,201 @@ func (e *Engine) PlayTarget(ctx context.Context, t Target) error {
 	}
 }
 
-// playStation loads a radio stream and starts tracklist polling if supported.
+// ---- Podcast playback (Up Next) ----
+
+func (e *Engine) playUpNextTop(ctx context.Context) error {
+	e.stopTracklist()
+	episodes, err := e.fetchUpNext(ctx)
+	if err != nil {
+		return err
+	}
+	if len(episodes) == 0 {
+		return errors.New("Up Next is empty")
+	}
+
+	e.pmu.Lock()
+	e.queue = episodes
+	e.idx = 0
+	e.pmu.Unlock()
+
+	go e.refreshSkipSettings(context.Background())
+	return e.playEpisodeAt(ctx, 0)
+}
+
+// playEpisodeAt resumes the episode at index i at its saved position.
+func (e *Engine) playEpisodeAt(ctx context.Context, i int) error {
+	e.pmu.Lock()
+	if i < 0 || i >= len(e.queue) {
+		e.pmu.Unlock()
+		return errors.New("episode index out of range")
+	}
+	ep := e.queue[i]
+	e.pmu.Unlock()
+
+	if ep.URL == "" {
+		return errors.New("episode has no playable URL")
+	}
+
+	// The real progress lives in /user/podcast/episodes, not up_next/sync.
+	if info, ok := e.playbackInfoFor(ctx, ep); ok {
+		if info.PlayedUpTo > 0 {
+			ep.PlayedUpTo = info.PlayedUpTo
+		}
+		if info.Duration > 0 {
+			ep.Duration = info.Duration
+		}
+	}
+
+	resume := time.Duration(ep.PlayedUpTo) * time.Second
+	if err := e.player.Load(ep.URL, resume); err != nil {
+		return err
+	}
+
+	e.pmu.Lock()
+	e.idx = i
+	e.current = ep
+	e.hasCurrent = true
+	e.lastSavePos = resume
+	e.lastSaveAt = e.clock()
+	e.pmu.Unlock()
+
+	e.update(func(n *NowPlaying) {
+		n.Title = ep.Title
+		n.Subtitle = "Up Next"
+		n.Playing = true
+		n.Position = resume
+		n.Duration = time.Duration(ep.Duration) * time.Second
+		n.IsLive = false
+	})
+	return nil
+}
+
+// playbackInfoFor returns merged progress for an episode, caching per podcast.
+func (e *Engine) playbackInfoFor(ctx context.Context, ep pocketcasts.Episode) (pocketcasts.PlaybackInfo, bool) {
+	if ep.PodcastUUID == "" {
+		return pocketcasts.PlaybackInfo{}, false
+	}
+	e.pmu.Lock()
+	cached, ok := e.infoCache[ep.PodcastUUID]
+	e.pmu.Unlock()
+
+	if !ok {
+		var infos []pocketcasts.PlaybackInfo
+		err := e.withToken(ctx, func(token string) error {
+			var err error
+			infos, err = e.api.PodcastEpisodes(ctx, token, ep.PodcastUUID)
+			return err
+		})
+		cached = map[string]pocketcasts.PlaybackInfo{}
+		if err == nil {
+			for _, in := range infos {
+				cached[in.UUID] = in
+			}
+		}
+		e.pmu.Lock()
+		e.infoCache[ep.PodcastUUID] = cached
+		e.pmu.Unlock()
+	}
+
+	info, found := cached[ep.UUID]
+	return info, found
+}
+
+func (e *Engine) refreshSkipSettings(ctx context.Context) {
+	var s pocketcasts.Skip
+	err := e.withToken(ctx, func(token string) error {
+		var err error
+		s, err = e.api.SkipSettings(ctx, token)
+		return err
+	})
+	if err != nil || (s.Back == 0 && s.Forward == 0) {
+		return
+	}
+	e.pmu.Lock()
+	e.skip = s
+	e.pmu.Unlock()
+}
+
+// ---- Write-back, finish, advance ----
+
+// maybeSave writes the current position back, throttled to saveInterval unless
+// force is set. No-op for live streams or when nothing is playing.
+func (e *Engine) maybeSave(force bool, status pocketcasts.EpisodeStatus) {
+	if e.isLive() {
+		return
+	}
+	pos := e.player.State().Position
+	now := e.clock()
+
+	e.pmu.Lock()
+	if !e.hasCurrent {
+		e.pmu.Unlock()
+		return
+	}
+	if !force && (now.Sub(e.lastSaveAt) < saveInterval || pos == e.lastSavePos) {
+		e.pmu.Unlock()
+		return
+	}
+	cur := e.current
+	e.lastSaveAt = now
+	e.lastSavePos = pos
+	e.pmu.Unlock()
+
+	go e.saveProgress(context.Background(), cur, pos, status)
+}
+
+func (e *Engine) saveProgress(ctx context.Context, ep pocketcasts.Episode, pos time.Duration, status pocketcasts.EpisodeStatus) {
+	dur := ep.Duration
+	if dur == 0 {
+		dur = int(e.player.State().Duration.Seconds())
+	}
+	_ = e.withToken(ctx, func(token string) error {
+		return e.api.UpdateEpisode(ctx, token, pocketcasts.EpisodeUpdate{
+			UUID:        ep.UUID,
+			PodcastUUID: ep.PodcastUUID,
+			Position:    int(pos.Seconds()),
+			Duration:    dur,
+			Status:      status,
+		})
+	})
+}
+
+// completeAndAdvance marks the current episode completed, removes it from Up
+// Next, and auto-plays the next episode.
+func (e *Engine) completeAndAdvance() {
+	e.pmu.Lock()
+	if !e.hasCurrent {
+		e.pmu.Unlock()
+		return
+	}
+	cur := e.current
+	next := e.idx + 1
+	e.hasCurrent = false
+	e.pmu.Unlock()
+
+	dur := time.Duration(cur.Duration) * time.Second
+	e.saveProgress(context.Background(), cur, dur, pocketcasts.StatusCompleted)
+	_ = e.withToken(context.Background(), func(token string) error {
+		return e.api.RemoveFromUpNext(context.Background(), token, e.auth.DeviceID(), cur)
+	})
+
+	e.pmu.Lock()
+	hasNext := next < len(e.queue)
+	e.pmu.Unlock()
+	if hasNext {
+		_ = e.playEpisodeAt(context.Background(), next)
+		return
+	}
+	e.update(func(n *NowPlaying) { n.Playing = false })
+}
+
+// ---- Radio (station) playback ----
+
 func (e *Engine) playStation(st radio.Station) error {
 	e.stopTracklist()
+	e.pmu.Lock()
+	e.hasCurrent = false // leaving podcast context; no write-back for stations
+	e.pmu.Unlock()
 	if st.StreamURL == "" {
 		return errors.New("station has no stream URL")
 	}
@@ -144,8 +366,6 @@ func (e *Engine) playStation(st radio.Station) error {
 	return nil
 }
 
-// startTracklist polls the station's tracklist on an interval, setting the
-// now-playing title to the top track ("Song — Artist").
 func (e *Engine) startTracklist(st radio.Station) {
 	if e.tracklister == nil || !e.tracklister.HasTracklist(st) {
 		return
@@ -194,86 +414,94 @@ func (e *Engine) stopTracklist() {
 	}
 }
 
-func (e *Engine) playUpNextTop(ctx context.Context) error {
-	e.stopTracklist()
-	episodes, err := e.withAuth(ctx, func(token string) ([]pocketcasts.Episode, error) {
-		return e.api.UpNext(ctx, token, e.auth.DeviceID())
-	})
-	if err != nil {
+// ---- Token helpers ----
+
+func (e *Engine) fetchUpNext(ctx context.Context) ([]pocketcasts.Episode, error) {
+	var eps []pocketcasts.Episode
+	err := e.withToken(ctx, func(token string) error {
+		var err error
+		eps, err = e.api.UpNext(ctx, token, e.auth.DeviceID())
 		return err
-	}
-	if len(episodes) == 0 {
-		return errors.New("Up Next is empty")
-	}
-	ep := episodes[0]
-	if ep.URL == "" {
-		return errors.New("top episode has no playable URL")
-	}
-	// M1 starts at 0; podcast resume (playedUpTo) lands in M3.
-	if err := e.player.Load(ep.URL, 0); err != nil {
-		return err
-	}
-	e.update(func(n *NowPlaying) {
-		n.Title = ep.Title
-		n.Subtitle = "Up Next"
-		n.Playing = true
-		n.Position = 0
-		n.Duration = time.Duration(ep.Duration) * time.Second
-		n.IsLive = false
 	})
-	return nil
+	return eps, err
 }
 
-// withAuth runs fn with a token, re-logging-in once on ErrInvalidCredentials.
-func (e *Engine) withAuth(ctx context.Context, fn func(token string) ([]pocketcasts.Episode, error)) ([]pocketcasts.Episode, error) {
-	token, ok := e.auth.Token()
-	if ok {
-		eps, err := fn(token)
-		if !errors.Is(err, pocketcasts.ErrInvalidCredentials) {
-			return eps, err
+// withToken runs fn with a token, re-logging-in once on ErrInvalidCredentials.
+func (e *Engine) withToken(ctx context.Context, fn func(token string) error) error {
+	if token, ok := e.auth.Token(); ok {
+		if err := fn(token); !errors.Is(err, pocketcasts.ErrInvalidCredentials) {
+			return err
 		}
-		// token rejected — fall through to relogin
 	}
 	newToken, err := e.auth.Relogin(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	return fn(newToken)
 }
 
-// TogglePlayback flips play/pause.
+// ---- Transport ----
+
+// TogglePlayback flips play/pause, saving progress (or completing) on pause.
 func (e *Engine) TogglePlayback() {
-	if e.player.State().Playing {
-		_ = e.player.Pause()
-		e.update(func(n *NowPlaying) { n.Playing = false })
-	} else {
+	if !e.player.State().Playing {
 		_ = e.player.Resume()
 		e.update(func(n *NowPlaying) { n.Playing = true })
+		return
 	}
+
+	_ = e.player.Pause()
+	e.update(func(n *NowPlaying) { n.Playing = false })
+
+	if e.isLive() {
+		return
+	}
+	st := e.player.State()
+	e.pmu.Lock()
+	has := e.hasCurrent
+	dur := time.Duration(e.current.Duration) * time.Second
+	e.pmu.Unlock()
+	if !has {
+		return
+	}
+	if dur <= 0 {
+		dur = st.Duration
+	}
+	if dur > 0 && dur-st.Position <= completeThreshold {
+		go e.completeAndAdvance()
+		return
+	}
+	e.maybeSave(true, pocketcasts.StatusInProgress)
 }
 
-// isLive reports whether the current source is a live stream (no seeking).
 func (e *Engine) isLive() bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.now.IsLive
 }
 
-// SkipForward seeks forward by defaultSkip. No-op on live streams.
+func (e *Engine) skipAmounts() (back, forward time.Duration) {
+	e.pmu.Lock()
+	defer e.pmu.Unlock()
+	return time.Duration(e.skip.Back) * time.Second, time.Duration(e.skip.Forward) * time.Second
+}
+
+// SkipForward seeks forward by the synced skip amount. No-op on live streams.
 func (e *Engine) SkipForward() {
 	if e.isLive() {
 		return
 	}
-	pos := e.player.State().Position
-	_ = e.player.Seek(pos + defaultSkip)
+	_, forward := e.skipAmounts()
+	_ = e.player.Seek(e.player.State().Position + forward)
 }
 
-// SkipBack seeks backward by defaultSkip, clamped at zero. No-op on live streams.
+// SkipBack seeks backward by the synced skip amount, clamped at zero.
 func (e *Engine) SkipBack() {
 	if e.isLive() {
 		return
 	}
-	pos := e.player.State().Position - defaultSkip
+	back, _ := e.skipAmounts()
+	pos := e.player.State().Position - back
 	if pos < 0 {
 		pos = 0
 	}
@@ -298,7 +526,8 @@ func (e *Engine) Close() error {
 	return e.player.Close()
 }
 
-// pump fans player events into NowPlaying updates.
+// ---- Event pump ----
+
 func (e *Engine) pump() {
 	for ev := range e.player.Events() {
 		switch ev.Kind {
@@ -312,12 +541,18 @@ func (e *Engine) pump() {
 				n.Playing = st.Playing
 				n.IsLive = st.IsLive
 			})
+			if st.Playing {
+				e.maybeSave(false, pocketcasts.StatusInProgress)
+			}
 		case player.Metadata:
 			if title := ev.Metadata["icy-title"]; title != "" {
 				e.update(func(n *NowPlaying) { n.Title = title })
 			}
 		case player.Ended:
 			e.update(func(n *NowPlaying) { n.Playing = false })
+			if !e.isLive() {
+				e.completeAndAdvance()
+			}
 		}
 	}
 }
