@@ -27,7 +27,7 @@ func (f *fakeAPI) Login(ctx context.Context, email, password string) (pocketcast
 func (f *fakeAPI) UpNext(ctx context.Context, token, deviceID string) ([]pocketcasts.Episode, error) {
 	n := atomic.AddInt32(&f.upNextCalls, 1)
 	if len(f.upNextErrSeq) > 0 {
-		idx := int(n-1)
+		idx := int(n - 1)
 		if idx >= len(f.upNextErrSeq) {
 			idx = len(f.upNextErrSeq) - 1
 		}

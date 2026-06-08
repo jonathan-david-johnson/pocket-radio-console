@@ -153,11 +153,11 @@ func (p *mpvPlayer) Close() error {
 
 // ipcMessage is an mpv IPC line (event or command reply).
 type ipcMessage struct {
-	Event    string          `json:"event"`
-	Name     string          `json:"name"`
-	Data     json.RawMessage `json:"data"`
-	Reason   string          `json:"reason"`
-	RequestID int            `json:"request_id"`
+	Event     string          `json:"event"`
+	Name      string          `json:"name"`
+	Data      json.RawMessage `json:"data"`
+	Reason    string          `json:"reason"`
+	RequestID int             `json:"request_id"`
 }
 
 func (p *mpvPlayer) readLoop() {

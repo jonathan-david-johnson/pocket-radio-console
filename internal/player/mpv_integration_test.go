@@ -77,13 +77,13 @@ func writeSilentWAV(t *testing.T, d time.Duration) string {
 	putU32(uint32(36 + dataLen))
 	put('W', 'A', 'V', 'E')
 	put('f', 'm', 't', ' ')
-	putU32(16)        // fmt chunk size
-	putU16(1)         // PCM
-	putU16(1)         // mono
-	putU32(rate)      // sample rate
-	putU32(rate * 2)  // byte rate
-	putU16(2)         // block align
-	putU16(16)        // bits per sample
+	putU32(16)       // fmt chunk size
+	putU16(1)        // PCM
+	putU16(1)        // mono
+	putU32(rate)     // sample rate
+	putU32(rate * 2) // byte rate
+	putU16(2)        // block align
+	putU16(16)       // bits per sample
 	put('d', 'a', 't', 'a')
 	putU32(uint32(dataLen))
 	buf = append(buf, make([]byte, dataLen)...) // silence

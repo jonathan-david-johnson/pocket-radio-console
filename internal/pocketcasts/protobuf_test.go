@@ -8,7 +8,8 @@ import (
 
 // Behavior 1a: encodeLoginRequest produces the exact bytes the menubar sends.
 // Golden fixture hand-computed from the wire format:
-//   field1(email) tag 0x0A, field2(password) tag 0x12, field3(scope) tag 0x1A.
+//
+//	field1(email) tag 0x0A, field2(password) tag 0x12, field3(scope) tag 0x1A.
 func TestEncodeLoginRequest_Golden(t *testing.T) {
 	got := encodeLoginRequest("a@b.com", "pw", "mobile")
 	want := []byte{

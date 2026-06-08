@@ -88,16 +88,21 @@ func (m Model) View() string {
 		title = "(loading…)"
 	}
 
-	var clock string
+	// Live streams show a [station] source tag; podcasts show a m:ss / m:ss clock.
+	var tag string
 	if m.now.IsLive {
-		clock = dimStyle.Render("live")
+		src := m.now.Subtitle
+		if src == "" {
+			src = "Live"
+		}
+		tag = dimStyle.Render("[" + src + "]")
 	} else {
-		clock = dimStyle.Render(fmt.Sprintf("%s / %s",
+		tag = dimStyle.Render(fmt.Sprintf("%s / %s",
 			fmtDuration(m.now.Position), fmtDuration(m.now.Duration)))
 	}
 
 	line := fmt.Sprintf("%s %s  %s",
-		playStyle.Render(icon), titleStyle.Render(title), clock)
+		playStyle.Render(icon), titleStyle.Render(title), tag)
 	hint := dimStyle.Render("  ·  space ⏯  ← → skip  q quit")
 	return line + hint + "\n"
 }

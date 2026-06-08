@@ -11,10 +11,14 @@ import (
 
 	"pocket-radio-console/internal/player"
 	"pocket-radio-console/internal/pocketcasts"
+	"pocket-radio-console/internal/radio"
 )
 
 // defaultSkip is the seek step until M3 wires synced skip settings.
 const defaultSkip = 45 * time.Second
+
+// tracklistInterval is how often the engine re-polls a station's tracklist.
+const tracklistInterval = 30 * time.Second
 
 // NowPlaying is the single state struct both UIs render.
 type NowPlaying struct {
@@ -34,6 +38,16 @@ type UpNextTop struct{}
 
 func (UpNextTop) isTarget() {}
 
+// NewestRelease plays the newest release (playback lands in M5).
+type NewestRelease struct{}
+
+func (NewestRelease) isTarget() {}
+
+// PlayStation plays a resolved radio station.
+type PlayStation struct{ Station radio.Station }
+
+func (PlayStation) isTarget() {}
+
 // Auth abstracts the credential/token resolution the engine needs. Tests inject
 // a fake; production uses the config.Store-backed implementation below.
 type Auth interface {
@@ -45,21 +59,34 @@ type Auth interface {
 	Relogin(ctx context.Context) (token string, err error)
 }
 
-// Engine orchestrates auth, the Pocket Casts API, and the Player.
+// Engine orchestrates auth, the Pocket Casts API, the radio surface, and the Player.
 type Engine struct {
-	api    pocketcasts.PocketCasts
-	player player.Player
-	auth   Auth
+	api         pocketcasts.PocketCasts
+	player      player.Player
+	auth        Auth
+	tracklister radio.Tracklister
 
-	mu  sync.RWMutex
-	now NowPlaying
+	mu       sync.RWMutex
+	now      NowPlaying
+	tlCancel context.CancelFunc // stops the running tracklist poller
 
 	subs []chan NowPlaying
 }
 
+// Option configures an Engine at construction.
+type Option func(*Engine)
+
+// WithTracklister enables station tracklist polling.
+func WithTracklister(t radio.Tracklister) Option {
+	return func(e *Engine) { e.tracklister = t }
+}
+
 // New builds an Engine from its boundary dependencies.
-func New(api pocketcasts.PocketCasts, p player.Player, auth Auth) *Engine {
+func New(api pocketcasts.PocketCasts, p player.Player, auth Auth, opts ...Option) *Engine {
 	e := &Engine{api: api, player: p, auth: auth}
+	for _, opt := range opts {
+		opt(e)
+	}
 	go e.pump()
 	return e
 }
@@ -84,15 +111,91 @@ func (e *Engine) State() NowPlaying {
 
 // PlayTarget resolves t to a Source and starts playback.
 func (e *Engine) PlayTarget(ctx context.Context, t Target) error {
-	switch t.(type) {
+	switch tt := t.(type) {
 	case UpNextTop:
 		return e.playUpNextTop(ctx)
+	case PlayStation:
+		return e.playStation(tt.Station)
+	case NewestRelease:
+		return errors.New("New Releases playback lands in M5")
 	default:
 		return errors.New("unsupported target")
 	}
 }
 
+// playStation loads a radio stream and starts tracklist polling if supported.
+func (e *Engine) playStation(st radio.Station) error {
+	e.stopTracklist()
+	if st.StreamURL == "" {
+		return errors.New("station has no stream URL")
+	}
+	if err := e.player.Load(st.StreamURL, 0); err != nil {
+		return err
+	}
+	e.update(func(n *NowPlaying) {
+		n.Title = st.Name
+		n.Subtitle = st.Name
+		n.Playing = true
+		n.Position = 0
+		n.Duration = 0
+		n.IsLive = true // refined by mpv duration on the first tick
+	})
+	e.startTracklist(st)
+	return nil
+}
+
+// startTracklist polls the station's tracklist on an interval, setting the
+// now-playing title to the top track ("Song — Artist").
+func (e *Engine) startTracklist(st radio.Station) {
+	if e.tracklister == nil || !e.tracklister.HasTracklist(st) {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	e.mu.Lock()
+	e.tlCancel = cancel
+	e.mu.Unlock()
+
+	go func() {
+		e.pollTracklistOnce(ctx, st)
+		ticker := time.NewTicker(tracklistInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				e.pollTracklistOnce(ctx, st)
+			}
+		}
+	}()
+}
+
+func (e *Engine) pollTracklistOnce(ctx context.Context, st radio.Station) {
+	tracks, err := e.tracklister.Tracklist(ctx, st)
+	if err != nil || ctx.Err() != nil {
+		return
+	}
+	e.update(func(n *NowPlaying) {
+		if len(tracks) > 0 {
+			n.Title = tracks[0].Label()
+		} else {
+			n.Title = st.Name // fall back to the station name
+		}
+	})
+}
+
+func (e *Engine) stopTracklist() {
+	e.mu.Lock()
+	cancel := e.tlCancel
+	e.tlCancel = nil
+	e.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 func (e *Engine) playUpNextTop(ctx context.Context) error {
+	e.stopTracklist()
 	episodes, err := e.withAuth(ctx, func(token string) ([]pocketcasts.Episode, error) {
 		return e.api.UpNext(ctx, token, e.auth.DeviceID())
 	})
@@ -149,14 +252,27 @@ func (e *Engine) TogglePlayback() {
 	}
 }
 
-// SkipForward seeks forward by defaultSkip.
+// isLive reports whether the current source is a live stream (no seeking).
+func (e *Engine) isLive() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.now.IsLive
+}
+
+// SkipForward seeks forward by defaultSkip. No-op on live streams.
 func (e *Engine) SkipForward() {
+	if e.isLive() {
+		return
+	}
 	pos := e.player.State().Position
 	_ = e.player.Seek(pos + defaultSkip)
 }
 
-// SkipBack seeks backward by defaultSkip, clamped at zero.
+// SkipBack seeks backward by defaultSkip, clamped at zero. No-op on live streams.
 func (e *Engine) SkipBack() {
+	if e.isLive() {
+		return
+	}
 	pos := e.player.State().Position - defaultSkip
 	if pos < 0 {
 		pos = 0
@@ -164,8 +280,11 @@ func (e *Engine) SkipBack() {
 	_ = e.player.Seek(pos)
 }
 
-// Scrub seeks by a relative delta.
+// Scrub seeks by a relative delta. No-op on live streams.
 func (e *Engine) Scrub(d time.Duration) {
+	if e.isLive() {
+		return
+	}
 	pos := e.player.State().Position + d
 	if pos < 0 {
 		pos = 0
@@ -173,8 +292,11 @@ func (e *Engine) Scrub(d time.Duration) {
 	_ = e.player.Seek(pos)
 }
 
-// Close shuts down the player.
-func (e *Engine) Close() error { return e.player.Close() }
+// Close stops the tracklist poller and shuts down the player.
+func (e *Engine) Close() error {
+	e.stopTracklist()
+	return e.player.Close()
+}
 
 // pump fans player events into NowPlaying updates.
 func (e *Engine) pump() {

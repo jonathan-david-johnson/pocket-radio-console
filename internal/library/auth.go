@@ -38,6 +38,15 @@ func (a *StoreAuth) Token() (string, bool) {
 // DeviceID returns the stable device id.
 func (a *StoreAuth) DeviceID() string { return a.deviceID }
 
+// UserUUID returns the cached Pocket Casts user UUID (for Supabase favorites).
+func (a *StoreAuth) UserUUID() string {
+	st, err := a.Store.LoadState()
+	if err != nil {
+		return ""
+	}
+	return st.UserUUID
+}
+
 // Relogin authenticates from config creds and caches token + uuid in state.json.
 func (a *StoreAuth) Relogin(ctx context.Context) (string, error) {
 	if a.Config.Email == "" || a.Config.Password == "" {
